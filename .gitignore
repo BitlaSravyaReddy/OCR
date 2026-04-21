@@ -1,0 +1,63 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+.env.*
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+API_KEY_DIAGNOSTIC_REPORT.txt
+API_KEY_FIX_SUMMARY.md
+.tmp_single_input/
+TYPE_ERRORS_FIXED.md
+# Project artifacts / local data
+Completed/
+OUTPUTS/
+outputs_new/
+results*/
+.tmp_single_input/
+images/
+*.jsonl
+
+# Large docs / notebook outputs (keep prompts + source code only)
+*.ipynb_checkpoints/
+
+# Non-code artifacts
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.exe
+*.tcp
+Purchase/*.json
+Sales/*.json
+json_*_parse_output.json

@@ -1,0 +1,7 @@
+{
+  "main_source_folder_path": "C:/Users/hrhar/Documents/TTTTT/HS TALLY SOFT",
+  "concurrency": 8,
+  "request_timeout": 300,
+  "max_attempts": 2,
+  "idle_wait": 10
+}

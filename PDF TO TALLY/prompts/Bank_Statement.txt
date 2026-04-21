@@ -1,0 +1,41 @@
+i want to convert this into json format so that we can import into tally You are an expert data extraction assistant. The document is a commercial Bank Statement provided by the user for back-office processing. It may contain PII (e.g., PAN/phone). You have consent to extract these fields. Analyze the provided invoice image and extract the following fields. Provide the output *only* in a valid JSON format, with no other text.
+
+{
+
+  "BankStatement": [
+
+    {
+
+      "Sr.No.": 1,
+
+      "bankDate": "01/04/2025",
+
+      "Narration": "Int.Pd:01-11-2023 to 31-01-2024",
+
+      "ChequeNo": "",
+
+      "Withdrawal": 0.0,
+
+      "Deposits": 0.0,
+
+      "Balance": 1611104.94,
+
+      "AutoLedgerNameSuggestFromNarration": "Bank Interest",
+
+      "GroupOfLedAsPerTally": "Indirect Incomes",
+
+      "VchType": "Receipt"
+
+    }
+
+  ]
+
+} 
+
+and AutoLedgerNameSuggestFromNarration should be like professional Name Like anyone can create that name into tally should human Name Meaningfull name should be extract properly it suggest ALANKAR BATCH ASSETS (UPI) that is not correct actual bussiness or expense name like ALANKAR BATCH ASSETS hope u got
+
+dont skip any row check full page carefully and dont skip any row which related to statement
+Withdrawal : take amount only if bank balance has been reduced than Withdrawal else Deposits [Dont do Mistake give me exact Amount and Proper Amount In both Withdrawal and Deposits Fields]
+VchType	   : if Balance has been reduced then Should be "Payment" else "Receipt" [dont do mistake here u are expert]
+
+ 
