@@ -13,6 +13,24 @@ from llm_request import load_api_key
 
 LOGGER = logging.getLogger(__name__)
 
+REMOVE_LINES_IF_CONTAIN = (
+    "original",
+    "duplicate",
+    "triplicate",
+    "transport",
+    "remarks",
+    "reference",
+)
+
+EXPENSE_BANNED_TOKENS = (
+    "prev due balance",
+    "a/c no",
+    "ifsc",
+    " dr ",
+    "dr.",
+    " dr:",
+)
+
 
 def load_prompt(invoice_type: str) -> str:
     """
@@ -40,6 +58,24 @@ def _trim_for_prompt(value: Any, max_rows: int = 40) -> Any:
     layout = out.get("layout")
     if isinstance(layout, list) and len(layout) > max_rows:
         out["layout"] = layout[:max_rows]
+    # Hard filter: remove noisy OCR rows before LLM guidance.
+    rows_filtered: List[Dict[str, Any]] = []
+    for row in out.get("rows", []) if isinstance(out.get("rows"), list) else []:
+        if not isinstance(row, dict):
+            continue
+        rt = str(row.get("row_text", "") or "")
+        low = rt.lower()
+        if any(tok in low for tok in REMOVE_LINES_IF_CONTAIN):
+            continue
+        if re.search(r"\birn\b|\back\b", low):
+            continue
+        if re.search(r"\b[a-f0-9]{10,}\b", rt, re.I):
+            continue
+        if re.fullmatch(r"\s*\d{8,}\s*", rt):
+            continue
+        rows_filtered.append(row)
+    if rows_filtered:
+        out["rows"] = rows_filtered[:max_rows]
     return out
 
 
@@ -47,6 +83,25 @@ def _trim_boxes_for_prompt(value: Any, limit: int = 100) -> Any:
     if not isinstance(value, list):
         return value
     return value[:limit]
+
+
+def _strip_noise_lines(text: str) -> str:
+    if not text:
+        return ""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    filtered = []
+    for ln in lines:
+        low = ln.lower()
+        if any(tok in low for tok in REMOVE_LINES_IF_CONTAIN):
+            continue
+        if re.search(r"\birn\b|\back\b", low):
+            continue
+        if re.search(r"\b[a-f0-9]{10,}\b", ln, re.I):
+            continue
+        if re.fullmatch(r"\s*\d{8,}\s*", ln):
+            continue
+        filtered.append(ln)
+    return "\n".join(filtered)
 
 
 def _has_meaningful_structured_data(data: Dict[str, Any]) -> bool:
@@ -77,6 +132,7 @@ def refine_invoice_json_with_llm(
     Refine preprocessed intermediate JSON using Gemini.
     """
     prompt = prompt_text if prompt_text is not None else load_prompt(invoice_type)
+    cleaned_extracted_text = _strip_noise_lines(extracted_text or "")
 
     if model_name.startswith("models/"):
         model_name = model_name[7:]
@@ -99,7 +155,7 @@ Output policy (must follow):
 
 # OCR Raw Text (fallback context only):
 ```
-{(extracted_text or "")[:3000]}
+{cleaned_extracted_text[:3000]}
 ```
 
 Rules:
@@ -124,8 +180,8 @@ Primary source policy:
 """
     if isinstance(raw_ocr_context, dict):
         paddle_json = raw_ocr_context.get("paddle_json")
-        paddle_text = raw_ocr_context.get("paddle_text")
-        tesseract_text = raw_ocr_context.get("tesseract_text")
+        paddle_text = _strip_noise_lines(raw_ocr_context.get("paddle_text") or "")
+        tesseract_text = _strip_noise_lines(raw_ocr_context.get("tesseract_text") or "")
         tesseract_boxes = raw_ocr_context.get("tesseract_boxes")
         message += f"""
 
@@ -137,17 +193,34 @@ Paddle OCR JSON (trimmed):
 
 Paddle OCR text (trimmed):
 ```
-{(paddle_text or "")[:3000]}
+{(paddle_text or "")[:1800]}
 ```
 
 Tesseract OCR text (trimmed):
 ```
-{(tesseract_text or "")[:3000]}
+{(tesseract_text or "")[:1800]}
 ```
 
 Tesseract boxes sample (trimmed):
 ```json
 {json.dumps(_trim_boxes_for_prompt(tesseract_boxes, limit=100), ensure_ascii=False, indent=2)}
+```
+"""
+    parties = structured_data.get("parties", {}) if isinstance(structured_data.get("parties"), dict) else {}
+    supplier_candidates = parties.get("_supplier_candidates", []) if isinstance(parties.get("_supplier_candidates"), list) else []
+    customer_candidates = parties.get("_customer_candidates", []) if isinstance(parties.get("_customer_candidates"), list) else []
+    if supplier_candidates or customer_candidates:
+        compact = {
+            "supplier_candidates": supplier_candidates[:3],
+            "customer_candidates": customer_candidates[:3],
+            "supplier_gst": parties.get("Supplier_GST"),
+            "customer_gst": parties.get("Customer_GSTIN"),
+        }
+        message += f"""
+
+# Compact Party Evidence (highest priority for names):
+```json
+{json.dumps(compact, ensure_ascii=False, indent=2)}
 ```
 """
     if party_segmentation:
@@ -915,6 +988,7 @@ def normalize_final_invoice_json(
 ) -> Dict[str, Any]:
     fallback = _structured_to_final(structured_data)
     rows = _ocr_rows(structured_data)
+    extracted_text = _strip_noise_lines(extracted_text or "")
     out: Dict[str, Any] = {}
 
     for key in TARGET_TOP_LEVEL_KEYS:
@@ -935,10 +1009,14 @@ def normalize_final_invoice_json(
     if str(out.get("Invoice_Date") or "").strip() == str(out.get("Invoice_Number") or "").strip():
         out["Invoice_Number"] = None
 
-    # Deterministic total: highest amount seen in OCR text.
-    max_amt = _extract_highest_amount(extracted_text or "")
-    if max_amt is not None:
-        out["Total_Amount"] = max_amt
+    # Deterministic total: prefer G.Total / Grand Total line, fallback to highest amount.
+    g_total_amt = _extract_gtotal_amount(extracted_text or "")
+    if g_total_amt is not None:
+        out["Total_Amount"] = g_total_amt
+    else:
+        max_amt = _extract_highest_amount(extracted_text or "")
+        if max_amt is not None:
+            out["Total_Amount"] = max_amt
     if out.get("Taxable_Amount") in (None, ""):
         out["Taxable_Amount"] = _normalize_nullish(fallback.get("Taxable_Amount"))
 
@@ -946,9 +1024,17 @@ def normalize_final_invoice_json(
     seg = structured_data.get("party_segmentation", {}) if isinstance(structured_data.get("party_segmentation"), dict) else {}
     seg_supplier = seg.get("supplier", {}) if isinstance(seg.get("supplier"), dict) else {}
     seg_customer = seg.get("customer", {}) if isinstance(seg.get("customer"), dict) else {}
+    supplier_candidates = parties.get("_supplier_candidates", []) if isinstance(parties.get("_supplier_candidates"), list) else []
+    customer_candidates = parties.get("_customer_candidates", []) if isinstance(parties.get("_customer_candidates"), list) else []
+    supplier_c1 = supplier_candidates[0] if len(supplier_candidates) > 0 else None
+    supplier_c2 = supplier_candidates[1] if len(supplier_candidates) > 1 else None
+    customer_c1 = customer_candidates[0] if len(customer_candidates) > 0 else None
+    customer_c2 = customer_candidates[1] if len(customer_candidates) > 1 else None
 
     # Guardrail: never keep label-like/address-like values as party names.
     out["SupplierName"] = _pick_first_valid_name(
+        supplier_c1,
+        supplier_c2,
         out.get("SupplierName"),
         seg_supplier.get("name"),
         parties.get("SupplierName"),
@@ -956,6 +1042,8 @@ def normalize_final_invoice_json(
         _extract_supplier_name_from_text(extracted_text or ""),
     )
     out["Customer_Name"] = _pick_first_valid_name(
+        customer_c1,
+        customer_c2,
         out.get("Customer_Name"),
         seg_customer.get("name"),
         parties.get("Customer_Name"),
@@ -987,14 +1075,26 @@ def normalize_final_invoice_json(
 
     supplier_from_rows, supplier_addr_rows = _extract_party_block_from_rows(rows, role="supplier")
     customer_from_rows, customer_addr_rows = _extract_party_block_from_rows(rows, role="customer")
-    if supplier_from_rows:
-        out["SupplierName"] = supplier_from_rows
-    if customer_from_rows:
-        out["Customer_Name"] = customer_from_rows
+    if supplier_from_rows and not _is_invalid_party_name(supplier_from_rows):
+        cur_supplier = out.get("SupplierName")
+        cur_supplier_bad = _is_invalid_party_name(cur_supplier)
+        if cur_supplier_bad or len(str(supplier_from_rows).strip()) > len(str(cur_supplier or "").strip()):
+            out["SupplierName"] = supplier_from_rows
+    if customer_from_rows and not _is_invalid_party_name(customer_from_rows):
+        cur_customer = out.get("Customer_Name")
+        cur_customer_bad = _is_invalid_party_name(cur_customer)
+        if cur_customer_bad or len(str(customer_from_rows).strip()) > len(str(cur_customer or "").strip()):
+            out["Customer_Name"] = customer_from_rows
     if supplier_addr_rows:
-        out["Supplier_address"] = supplier_addr_rows
+        cur_sa = _sanitize_address(out.get("Supplier_address"))
+        new_sa = _sanitize_address(supplier_addr_rows)
+        if new_sa and (not cur_sa or len(new_sa) > len(cur_sa)):
+            out["Supplier_address"] = new_sa
     if customer_addr_rows:
-        out["Customer_address"] = customer_addr_rows
+        cur_ca = _sanitize_address(out.get("Customer_address"))
+        new_ca = _sanitize_address(customer_addr_rows)
+        if new_ca and (not cur_ca or len(new_ca) > len(cur_ca)):
+            out["Customer_address"] = new_ca
     out["Supplier_address"] = _format_address_human(out.get("Supplier_address"))
     out["Customer_address"] = _format_address_human(out.get("Customer_address"))
 
@@ -1111,6 +1211,8 @@ def _normalize_expenses(value: Any, fallback_expenses: Any) -> List[Dict[str, An
         if "amount chargeable" in name:
             continue
         if any(k in name for k in ("cgst", "sgst", "igst", "tax", "% %")):
+            continue
+        if any(tok in name for tok in EXPENSE_BANNED_TOKENS):
             continue
         if not re.search(r"[a-z]", name):
             continue
@@ -1316,6 +1418,18 @@ def _extract_highest_amount(text: str) -> Optional[float]:
     if not values:
         return None
     return max(values)
+
+
+def _extract_gtotal_amount(text: str) -> Optional[float]:
+    if not text:
+        return None
+    for line in text.splitlines():
+        low = line.lower()
+        if "g. total" in low or "g total" in low or "grand total" in low:
+            val = _largest_amount_in_line(line)
+            if val is not None:
+                return val
+    return None
 
 
 def _extract_invoice_no_from_rows(rows: Any) -> Optional[str]:
@@ -1583,6 +1697,14 @@ def _is_invalid_party_name(value: Any) -> bool:
     if _contains_reject_token(text):
         return True
     if re.search(r"\b(invoice|dated|delivery|reference|terms of)\b", low):
+        return True
+    if re.fullmatch(r"[a-f0-9]{10,}", text, re.I):
+        return True
+    if re.search(r"\b[a-f0-9]{10,}\b", text, re.I):
+        return True
+    if any(ch.isdigit() for ch in text) and len(text) >= 8:
+        return True
+    if re.search(r"\b[0-9A-Z]{15}\b", text.upper()):
         return True
     if _looks_address_like(text):
         return True
@@ -1900,7 +2022,7 @@ def _extract_party_block_from_rows(rows: List[Dict[str, Any]], role: str) -> Tup
 
     buyer_idx = None
     for i, low in enumerate(lows[:120]):
-        if any(k in low for k in ("buyer (bill to)", "buyer", "bill to", "ship to", "consignee", "customer")):
+        if any(k in low for k in ("buyer (bill to)", "buyer", "bill to", "ship to", "consignee", "customer", "m/s")):
             buyer_idx = i
             break
 
@@ -1972,8 +2094,9 @@ def _extract_party_block_from_rows(rows: List[Dict[str, Any]], role: str) -> Tup
         address = " | ".join(dedup_addr[:3]) if dedup_addr else None
         return (name, address)
 
-    # Supplier block: before buyer label only.
+    # Supplier block: top section before buyer label only and near supplier GST.
     end = buyer_idx if buyer_idx is not None else min(len(lines), 40)
+    end = min(end, 30)
     scan = lines[:end]
     name = None
     name_idx = None
@@ -2051,12 +2174,15 @@ def _extract_products_from_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, An
         low = line.lower()
         if not line:
             continue
-        if "description of goods" in low and ("qty" in low or "rate" in low):
+        if any(tok in low for tok in ("description", "description of goods")) and any(tok in low for tok in ("qty", "quantity")) and "rate" in low:
             in_table = True
             continue
         if not in_table:
             continue
-        if low.startswith("sgst") or low.startswith("cgst") or low.startswith("round off") or low.startswith("total"):
+        if any(
+            low.startswith(tok)
+            for tok in ("sub total", "subtotal", "cgst", "sgst", "igst", "g. total", "grand total", "total")
+        ):
             break
 
         m_serial = re.match(r"^\s*(\d+)\s+(.*)$", line)
@@ -2172,6 +2298,8 @@ def _extract_expenses_from_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, An
             continue
         low_name = name.lower()
         if any(k in low_name for k in ("cgst", "sgst", "igst", "tax", "total")):
+            continue
+        if any(tok in low_name for tok in EXPENSE_BANNED_TOKENS):
             continue
         if not re.search(r"[a-z]", low_name):
             continue

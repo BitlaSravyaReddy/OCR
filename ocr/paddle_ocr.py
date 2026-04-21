@@ -105,4 +105,7 @@ def run_paddle_ocr(
 
     extracted_text = "\n\n".join(page.text for page in pages if page.text)
     extracted_json = _STRUCTURER.extract_document_structure(file_path, pages)
+    if isinstance(extracted_json, dict):
+        extracted_json.pop("normalized_fields", None)
+        extracted_json.pop("records", None)
     return extracted_json, extracted_text

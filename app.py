@@ -8,6 +8,7 @@ import streamlit as st
 
 from llm.refine import normalize_final_invoice_json, refine_invoice_json_with_llm
 from ocr.ocr_pipeline import run_multi_ocr, supported_upload_extensions
+from preprocessing.preprocess import preprocess_invoice
 
 
 st.set_page_config(page_title="Invoice Extraction System", layout="wide")
@@ -209,6 +210,91 @@ def _render_debug_downloads(uploaded_name: str, ocr_debug: Dict[str, Any]) -> No
     )
 
 
+def _render_structure_debug_panel(structured_data: Dict[str, Any]) -> None:
+    structure_debug = structured_data.get("_structure_debug", {}) if isinstance(structured_data, dict) else {}
+    blocks = structure_debug.get("blocks", []) if isinstance(structure_debug, dict) else []
+    products = structured_data.get("products", []) if isinstance(structured_data, dict) else []
+    expenses = structured_data.get("expenses", []) if isinstance(structured_data, dict) else []
+    totals = structured_data.get("totals", {}) if isinstance(structured_data, dict) else {}
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Detected Blocks", len(blocks) if isinstance(blocks, list) else 0)
+    c2.metric("Extracted Products", len(products) if isinstance(products, list) else 0)
+    c3.metric("Extracted Expenses", len(expenses) if isinstance(expenses, list) else 0)
+
+    st.markdown("**Block Labels**")
+    if isinstance(blocks, list) and blocks:
+        st.dataframe(blocks, use_container_width=True)
+    else:
+        st.info("No structure blocks detected.")
+
+    st.markdown("**Extracted Table Rows (Products)**")
+    if isinstance(products, list) and products:
+        st.dataframe(products, use_container_width=True)
+    else:
+        st.info("No product rows extracted.")
+
+    st.markdown("**Extracted Summary (Expenses + Totals)**")
+    summary_payload = {
+        "expenses": expenses if isinstance(expenses, list) else [],
+        "totals": totals if isinstance(totals, dict) else {},
+    }
+    st.json(summary_payload)
+
+
+def _render_party_debug_panel(structured_data: Dict[str, Any], llm_context_text: str, raw_ocr_context: Dict[str, Any]) -> None:
+    parties = structured_data.get("parties", {}) if isinstance(structured_data, dict) else {}
+    supplier_candidates = parties.get("_supplier_candidates", []) if isinstance(parties, dict) else []
+    customer_candidates = parties.get("_customer_candidates", []) if isinstance(parties, dict) else []
+
+    st.markdown("**Selected Party Fields (Pre-LLM)**")
+    st.json(
+        {
+            "SupplierName": parties.get("SupplierName"),
+            "Customer_Name": parties.get("Customer_Name"),
+            "Supplier_GST": parties.get("Supplier_GST"),
+            "Customer_GSTIN": parties.get("Customer_GSTIN"),
+            "Supplier_Address": parties.get("Supplier_Address"),
+            "Customer_address": parties.get("Customer_address"),
+        }
+    )
+
+    st.markdown("**Ranked Party Candidates (Block-Level)**")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("Supplier Candidates")
+        st.json(supplier_candidates if isinstance(supplier_candidates, list) else [])
+    with c2:
+        st.write("Customer Candidates")
+        st.json(customer_candidates if isinstance(customer_candidates, list) else [])
+
+    st.markdown("**Compact Party Evidence Sent To LLM**")
+    st.json(
+        {
+            "supplier_candidates": supplier_candidates[:3] if isinstance(supplier_candidates, list) else [],
+            "customer_candidates": customer_candidates[:3] if isinstance(customer_candidates, list) else [],
+            "supplier_gst": parties.get("Supplier_GST"),
+            "customer_gst": parties.get("Customer_GSTIN"),
+        }
+    )
+
+    st.markdown("**Raw OCR Context Snapshot**")
+    paddle_rows = 0
+    if isinstance(raw_ocr_context, dict):
+        paddle_json = raw_ocr_context.get("paddle_json")
+        if isinstance(paddle_json, dict) and isinstance(paddle_json.get("rows"), list):
+            paddle_rows = len(paddle_json.get("rows", []))
+    st.json(
+        {
+            "paddle_rows": paddle_rows,
+            "paddle_text_chars": len(str(raw_ocr_context.get("paddle_text", "") or "")) if isinstance(raw_ocr_context, dict) else 0,
+            "tesseract_text_chars": len(str(raw_ocr_context.get("tesseract_text", "") or "")) if isinstance(raw_ocr_context, dict) else 0,
+            "llm_context_chars": len(llm_context_text or ""),
+        }
+    )
+    st.code((llm_context_text or "")[:2000], language="text")
+
+
 @st.cache_data(show_spinner=False)
 def _cached_multi_ocr(
     file_bytes: bytes,
@@ -272,17 +358,12 @@ def main() -> None:
                 paddle_text = paddle_payload.get("text") if isinstance(paddle_payload, dict) else ""
                 tesseract_payload = ocr_debug.get("tesseract", {}) if isinstance(ocr_debug, dict) else {}
                 tesseract_text = tesseract_payload.get("text") if isinstance(tesseract_payload, dict) else ""
-                # Do not use preprocessing/fusion-derived structure for LLM guidance.
-                # LLM must infer directly from raw OCR engine outputs.
-                structured_data = {
-                    "header": {},
-                    "parties": {},
-                    "products": [],
-                    "expenses": [],
-                    "totals": {},
-                    "_ocr_rows": paddle_json.get("rows", []) if isinstance(paddle_json, dict) else [],
-                    "_ocr_layout": paddle_json.get("layout", []) if isinstance(paddle_json, dict) else [],
-                }
+                step_status.info("Building deterministic structure...")
+                structured_data = preprocess_invoice(extracted_json=extracted_json, extracted_text=extracted_text)
+                if not isinstance(structured_data, dict):
+                    structured_data = {}
+                structured_data.setdefault("_ocr_rows", paddle_json.get("rows", []) if isinstance(paddle_json, dict) else [])
+                structured_data.setdefault("_ocr_layout", paddle_json.get("layout", []) if isinstance(paddle_json, dict) else [])
 
                 # Pass raw OCR engine outputs to LLM for better entity resolution.
                 raw_ocr_context = {
@@ -293,7 +374,7 @@ def main() -> None:
                 }
                 llm_context_text = "\n".join(part for part in [paddle_text, tesseract_text] if part)
 
-                step_status.info("Generating final JSON from raw OCR...")
+                step_status.info("Resolving ambiguities with LLM...")
                 prompt_text = _load_prompt_from_prompts_dir(invoice_type)
                 llm_output = refine_invoice_json_with_llm(
                     structured_data=structured_data,
@@ -336,6 +417,8 @@ def main() -> None:
                     "final_json": final_json,
                     "ocr_debug": ocr_debug,
                     "structured_data": structured_data,
+                    "raw_ocr_context": raw_ocr_context,
+                    "llm_context_text": llm_context_text,
                     "show_debug": show_debug,
                 }
 
@@ -351,6 +434,8 @@ def main() -> None:
         final_json = last_run.get("final_json", {})
         ocr_debug = last_run.get("ocr_debug", {})
         structured_data = last_run.get("structured_data", {})
+        raw_ocr_context = last_run.get("raw_ocr_context", {})
+        llm_context_text = str(last_run.get("llm_context_text") or "")
         uploaded_name = str(last_run.get("uploaded_name") or "invoice")
         debug_enabled = bool(last_run.get("show_debug", False))
 
@@ -390,6 +475,10 @@ def main() -> None:
                 st.json(ocr_debug.get("fused", {}))
             with st.expander("OCR Errors", expanded=False):
                 st.json(ocr_debug.get("errors", {}))
+            with st.expander("Structure Engine Blocks", expanded=False):
+                _render_structure_debug_panel(structured_data)
+            with st.expander("Party Segmentation + LLM Context", expanded=False):
+                _render_party_debug_panel(structured_data, llm_context_text, raw_ocr_context)
             with st.expander("Structured Intermediate JSON", expanded=False):
                 st.json(structured_data)
 
