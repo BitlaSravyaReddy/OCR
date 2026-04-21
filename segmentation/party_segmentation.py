@@ -101,7 +101,7 @@ def _split_lines(text: str) -> List[str]:
     return [line for line in lines if line]
 
 
-def _left_header_lines_from_rows(rows: Any) -> List[str]:
+def _header_lines_from_rows(rows: Any) -> List[str]:
     if not isinstance(rows, list) or not rows:
         return []
 
@@ -114,38 +114,38 @@ def _left_header_lines_from_rows(rows: Any) -> List[str]:
             break
         header_rows.append(row)
 
-    xs: List[float] = []
-    for row in header_rows:
-        cells = row.get("cells", [])
-        if not isinstance(cells, list):
-            continue
-        for cell in cells:
-            if isinstance(cell, dict) and isinstance(cell.get("x"), (int, float)):
-                xs.append(float(cell["x"]))
-    if not xs:
-        return []
-
-    split_x = max(xs) * 0.58
     out: List[str] = []
     for row in header_rows:
         cells = row.get("cells", [])
-        parts: List[str] = []
-        if isinstance(cells, list):
+        row_text = _clean(row.get("row_text", ""))
+
+        if isinstance(cells, list) and cells:
             sorted_cells = sorted(
-                [c for c in cells if isinstance(c, dict)],
+                [c for c in cells if isinstance(c, dict) and _clean(c.get("text", ""))],
                 key=lambda c: float(c.get("x", 0.0)),
             )
-            for c in sorted_cells:
-                x = c.get("x")
-                if not isinstance(x, (int, float)):
-                    continue
-                if float(x) <= split_x:
-                    t = _clean(c.get("text", ""))
-                    if t:
-                        parts.append(t)
-        line = _clean(" ".join(parts))
-        if line and line not in out:
-            out.append(line)
+            if sorted_cells:
+                xs = [float(c.get("x", 0.0)) for c in sorted_cells]
+                spread = max(xs) - min(xs) if len(xs) > 1 else 0.0
+                gap_threshold = max(180.0, spread * 0.12)
+
+                segments: List[List[str]] = [[]]
+                prev_x: Optional[float] = None
+                for c in sorted_cells:
+                    cx = float(c.get("x", 0.0))
+                    ct = _clean(c.get("text", ""))
+                    if prev_x is not None and (cx - prev_x) > gap_threshold:
+                        segments.append([])
+                    segments[-1].append(ct)
+                    prev_x = cx
+
+                for seg in segments:
+                    seg_line = _clean(" ".join(seg))
+                    if seg_line and seg_line not in out:
+                        out.append(seg_line)
+
+        if row_text and row_text not in out:
+            out.append(row_text)
     return out
 
 
@@ -441,7 +441,7 @@ def segment_parties(structured_data: Dict[str, Any], fused_text: str) -> Dict[st
     Segment supplier and customer from preprocessed data + fused OCR text.
     Deterministic heuristics with anchor, positional, and GST proximity rules.
     """
-    row_lines = _left_header_lines_from_rows(structured_data.get("_ocr_rows"))
+    row_lines = _header_lines_from_rows(structured_data.get("_ocr_rows"))
     lines = row_lines if len(row_lines) >= 4 else _split_lines(fused_text)
     supplier_block, customer_block, method = _build_blocks_from_anchors(lines)
     if supplier_block is None:

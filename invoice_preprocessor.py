@@ -353,6 +353,8 @@ class InvoicePreprocessor:
             "Customer_Name": self._first_non_empty(customer_name, self._extract_customer_name(rows), safe_get(key_values, "buyer_name", "buyer", "customer"), safe_get(normalized_fields, "buyer_name", "Customer_Name")),
             "Supplier_GST": supplier_gst,
             "Customer_GSTIN": customer_gst or (gstins[1] if len(gstins) > 1 else None),
+            "Supplier_Address": self._extract_party_address(rows, ["supplier", "seller", "from"], ["buyer", "customer", "bill to", "ship to", "consignee"]),
+            "Customer_address": self._extract_party_address(rows, ["buyer", "customer", "bill to", "ship to", "consignee"], ["description", "hsn", "qty", "quantity", "total"]),
             "Address": self._extract_address(rows),
             "Email": self._first_match(EMAIL_PATTERN, full_text),
             "Phone": self._extract_phone_list(full_text),
@@ -784,6 +786,38 @@ class InvoicePreprocessor:
                 if len(parts) >= 3:
                     break
         value = clean_text(" | ".join(parts))
+        return value or None
+
+    def _extract_party_address(
+        self,
+        rows: Sequence[NormalizedRow],
+        anchor_labels: Sequence[str],
+        stop_labels: Sequence[str],
+    ) -> Optional[str]:
+        start_idx: Optional[int] = None
+        for idx, row in enumerate(rows[:60]):
+            low = row.text.lower()
+            if any(label in low for label in anchor_labels):
+                start_idx = idx
+                break
+        if start_idx is None:
+            return None
+
+        parts: List[str] = []
+        for idx in range(start_idx + 1, min(len(rows), start_idx + 8)):
+            text = clean_text(rows[idx].text)
+            low = text.lower()
+            if any(stop in low for stop in stop_labels):
+                break
+            if any(k in low for k in {"gstin", "date", "invoice", "order no", "delivery note", "state name"}):
+                continue
+            if len(text) < 4:
+                continue
+            if re.fullmatch(r"\d+", text):
+                continue
+            parts.append(text)
+
+        value = clean_text(" | ".join(parts[:3]))
         return value or None
 
     def _extract_phone_list(self, text: str) -> Optional[str]:

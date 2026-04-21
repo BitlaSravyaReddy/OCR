@@ -8,8 +8,6 @@ import streamlit as st
 
 from llm.refine import normalize_final_invoice_json, refine_invoice_json_with_llm
 from ocr.ocr_pipeline import run_multi_ocr, supported_upload_extensions
-from preprocessing.preprocess import preprocess_invoice
-from segmentation.party_segmentation import segment_parties
 
 
 st.set_page_config(page_title="Invoice Extraction System", layout="wide")
@@ -157,11 +155,65 @@ def _load_prompt_from_prompts_dir(invoice_type: str) -> str:
     return prompt_file.read_text(encoding="utf-8")
 
 
+def _render_debug_downloads(uploaded_name: str, ocr_debug: Dict[str, Any]) -> None:
+    base_name = Path(uploaded_name).stem
+    paddle_payload = ocr_debug.get("paddle", {}) if isinstance(ocr_debug, dict) else {}
+    tesseract_payload = ocr_debug.get("tesseract", {}) if isinstance(ocr_debug, dict) else {}
+    fused_payload = ocr_debug.get("fused", {}) if isinstance(ocr_debug, dict) else {}
+    errors_payload = ocr_debug.get("errors", {}) if isinstance(ocr_debug, dict) else {}
+
+    st.download_button(
+        label="Download Paddle OCR JSON",
+        data=json.dumps(paddle_payload.get("json", {}), ensure_ascii=False, indent=2),
+        file_name=f"{base_name}_paddle.json",
+        mime="application/json",
+    )
+    st.download_button(
+        label="Download Paddle OCR Text",
+        data=str(paddle_payload.get("text", "") or ""),
+        file_name=f"{base_name}_paddle.txt",
+        mime="text/plain",
+    )
+    st.download_button(
+        label="Download Tesseract OCR JSON",
+        data=json.dumps(
+            {
+                "text": tesseract_payload.get("text", ""),
+                "boxes": tesseract_payload.get("boxes"),
+                "text_length": tesseract_payload.get("text_length"),
+                "boxes_count": tesseract_payload.get("boxes_count"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        file_name=f"{base_name}_tesseract.json",
+        mime="application/json",
+    )
+    st.download_button(
+        label="Download Fused OCR JSON",
+        data=json.dumps(fused_payload.get("json", {}), ensure_ascii=False, indent=2),
+        file_name=f"{base_name}_fused.json",
+        mime="application/json",
+    )
+    st.download_button(
+        label="Download Fused OCR Text",
+        data=str(fused_payload.get("text", "") or ""),
+        file_name=f"{base_name}_fused.txt",
+        mime="text/plain",
+    )
+    st.download_button(
+        label="Download OCR Errors JSON",
+        data=json.dumps(errors_payload, ensure_ascii=False, indent=2),
+        file_name=f"{base_name}_ocr_errors.json",
+        mime="application/json",
+    )
+
+
 @st.cache_data(show_spinner=False)
 def _cached_multi_ocr(
     file_bytes: bytes,
     suffix: str,
-    cache_version: str = "multi_ocr_v3",
+    cache_version: str = "multi_ocr_v4",
 ) -> Tuple[Dict[str, Any], str, Dict[str, Any]]:
     """
     Cached OCR pass for repeated uploads of the same file.
@@ -182,6 +234,8 @@ def _cached_multi_ocr(
 
 def main() -> None:
     st.title("Invoice Extraction System")
+    if "last_run" not in st.session_state:
+        st.session_state["last_run"] = None
 
     with st.container():
         uploaded_file = st.file_uploader(
@@ -208,52 +262,46 @@ def main() -> None:
                 suffix = Path(uploaded_file.name).suffix or ".bin"
 
                 step_status.info("Running OCR...")
-                extracted_json, extracted_text, ocr_debug = _cached_multi_ocr(file_bytes, suffix, "multi_ocr_v3")
+                extracted_json, extracted_text, ocr_debug = _cached_multi_ocr(file_bytes, suffix, "multi_ocr_v4")
                 if not extracted_json and not extracted_text:
                     st.error("OCR failed: no text/data could be extracted from the file.")
                     return
 
-                step_status.info("Cleaning data...")
-                structured_data = preprocess_invoice(extracted_json, extracted_text)
-                # Preserve OCR rows/layout for downstream deterministic corrections.
-                if isinstance(extracted_json, dict):
-                    structured_data["_ocr_rows"] = extracted_json.get("rows", [])
-                    structured_data["_ocr_layout"] = extracted_json.get("layout", [])
-                party_segmentation = segment_parties(structured_data, extracted_text)
+                paddle_payload = ocr_debug.get("paddle", {}) if isinstance(ocr_debug, dict) else {}
+                paddle_json = paddle_payload.get("json") if isinstance(paddle_payload, dict) else None
+                paddle_text = paddle_payload.get("text") if isinstance(paddle_payload, dict) else ""
+                tesseract_payload = ocr_debug.get("tesseract", {}) if isinstance(ocr_debug, dict) else {}
+                tesseract_text = tesseract_payload.get("text") if isinstance(tesseract_payload, dict) else ""
+                # Do not use preprocessing/fusion-derived structure for LLM guidance.
+                # LLM must infer directly from raw OCR engine outputs.
+                structured_data = {
+                    "header": {},
+                    "parties": {},
+                    "products": [],
+                    "expenses": [],
+                    "totals": {},
+                    "_ocr_rows": paddle_json.get("rows", []) if isinstance(paddle_json, dict) else [],
+                    "_ocr_layout": paddle_json.get("layout", []) if isinstance(paddle_json, dict) else [],
+                }
 
-                # Inject segmented ownership before LLM.
-                parties = structured_data.get("parties", {}) if isinstance(structured_data.get("parties"), dict) else {}
-                supplier = party_segmentation.get("supplier", {})
-                customer = party_segmentation.get("customer", {})
-                if isinstance(supplier, dict):
-                    if supplier.get("name"):
-                        parties["SupplierName"] = supplier.get("name")
-                    if supplier.get("gst"):
-                        parties["Supplier_GST"] = supplier.get("gst")
-                    if supplier.get("phone"):
-                        parties["Phone"] = supplier.get("phone")
-                    if supplier.get("email"):
-                        parties["Email"] = supplier.get("email")
-                    if supplier.get("address"):
-                        parties["Supplier_Address"] = supplier.get("address")
-                if isinstance(customer, dict):
-                    if customer.get("name"):
-                        parties["Customer_Name"] = customer.get("name")
-                    if customer.get("gst"):
-                        parties["Customer_GSTIN"] = customer.get("gst")
-                    if customer.get("address"):
-                        parties["Customer_address"] = customer.get("address")
-                structured_data["parties"] = parties
-                structured_data["party_segmentation"] = party_segmentation
+                # Pass raw OCR engine outputs to LLM for better entity resolution.
+                raw_ocr_context = {
+                    "paddle_json": paddle_json,
+                    "paddle_text": paddle_text,
+                    "tesseract_text": tesseract_text,
+                    "tesseract_boxes": tesseract_payload.get("boxes") if isinstance(tesseract_payload, dict) else None,
+                }
+                llm_context_text = "\n".join(part for part in [paddle_text, tesseract_text] if part)
 
-                step_status.info("Generating final JSON...")
+                step_status.info("Generating final JSON from raw OCR...")
                 prompt_text = _load_prompt_from_prompts_dir(invoice_type)
                 llm_output = refine_invoice_json_with_llm(
                     structured_data=structured_data,
-                    extracted_text=extracted_text,
+                    extracted_text=llm_context_text,
                     invoice_type=invoice_type,
                     prompt_text=prompt_text,
-                    party_segmentation=party_segmentation,
+                    party_segmentation=None,
+                    raw_ocr_context=raw_ocr_context,
                 )
 
                 if llm_output is None:
@@ -261,9 +309,9 @@ def main() -> None:
                         "LLM refinement returned non-JSON response. "
                         "Showing structured preprocessed JSON fallback (check terminal logs for LLM parse details)."
                     )
-                    final_json = normalize_final_invoice_json({}, structured_data, extracted_text)
+                    final_json = normalize_final_invoice_json({}, structured_data, llm_context_text)
                 else:
-                    final_json = normalize_final_invoice_json(llm_output, structured_data, extracted_text)
+                    final_json = normalize_final_invoice_json(llm_output, structured_data, llm_context_text)
 
                 # Final UI guardrail: every invoice must have product details.
                 if not isinstance(final_json.get("productsArray"), list) or len(final_json.get("productsArray", [])) == 0:
@@ -283,44 +331,13 @@ def main() -> None:
                     st.error("Product details are mandatory but could not be extracted. Please review OCR quality.")
                     return
 
-                invoice_number, total_amount = _extract_summary_fields(final_json)
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.metric("Invoice Number", str(invoice_number) if invoice_number is not None else "N/A")
-                with c2:
-                    st.metric("Total Amount", str(total_amount) if total_amount is not None else "N/A")
-
-                st.subheader("Final Structured JSON")
-                st.json(final_json)
-
-                audit = _audit_datatypes(final_json)
-                with st.expander("Datatype Audit", expanded=not audit["ok"]):
-                    if audit["ok"]:
-                        st.success("Datatype contract check passed.")
-                    else:
-                        st.warning(f"Datatype violations found: {audit['violation_count']}")
-                        st.json(audit["violations"])
-
-                st.download_button(
-                    label="Download JSON",
-                    data=json.dumps(final_json, ensure_ascii=False, indent=2),
-                    file_name=f"{Path(uploaded_file.name).stem}_final.json",
-                    mime="application/json",
-                )
-
-                if show_debug:
-                    with st.expander("Paddle OCR Output", expanded=False):
-                        st.json(ocr_debug.get("paddle", {}))
-                    with st.expander("Tesseract OCR Output", expanded=False):
-                        st.json(ocr_debug.get("tesseract", {}))
-                    with st.expander("Fused OCR Output", expanded=False):
-                        st.json(ocr_debug.get("fused", {}))
-                    with st.expander("OCR Errors", expanded=False):
-                        st.json(ocr_debug.get("errors", {}))
-                    with st.expander("Structured Intermediate JSON", expanded=False):
-                        st.json(structured_data)
-                    with st.expander("Party Segmentation", expanded=False):
-                        st.json(party_segmentation)
+                st.session_state["last_run"] = {
+                    "uploaded_name": uploaded_file.name,
+                    "final_json": final_json,
+                    "ocr_debug": ocr_debug,
+                    "structured_data": structured_data,
+                    "show_debug": show_debug,
+                }
 
                 step_status.success("Processing complete.")
 
@@ -328,6 +345,53 @@ def main() -> None:
                 st.error(f"Prompt loading failed: {exc}")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Processing failed: {exc}")
+
+    last_run = st.session_state.get("last_run")
+    if isinstance(last_run, dict):
+        final_json = last_run.get("final_json", {})
+        ocr_debug = last_run.get("ocr_debug", {})
+        structured_data = last_run.get("structured_data", {})
+        uploaded_name = str(last_run.get("uploaded_name") or "invoice")
+        debug_enabled = bool(last_run.get("show_debug", False))
+
+        invoice_number, total_amount = _extract_summary_fields(final_json)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Invoice Number", str(invoice_number) if invoice_number is not None else "N/A")
+        with c2:
+            st.metric("Total Amount", str(total_amount) if total_amount is not None else "N/A")
+
+        st.subheader("Final Structured JSON")
+        st.json(final_json)
+
+        audit = _audit_datatypes(final_json)
+        with st.expander("Datatype Audit", expanded=not audit["ok"]):
+            if audit["ok"]:
+                st.success("Datatype contract check passed.")
+            else:
+                st.warning(f"Datatype violations found: {audit['violation_count']}")
+                st.json(audit["violations"])
+
+        st.download_button(
+            label="Download JSON",
+            data=json.dumps(final_json, ensure_ascii=False, indent=2),
+            file_name=f"{Path(uploaded_name).stem}_final.json",
+            mime="application/json",
+        )
+        with st.expander("Download OCR Artifacts", expanded=False):
+            _render_debug_downloads(uploaded_name, ocr_debug)
+
+        if debug_enabled:
+            with st.expander("Paddle OCR Output", expanded=False):
+                st.json(ocr_debug.get("paddle", {}))
+            with st.expander("Tesseract OCR Output", expanded=False):
+                st.json(ocr_debug.get("tesseract", {}))
+            with st.expander("Fused OCR Output", expanded=False):
+                st.json(ocr_debug.get("fused", {}))
+            with st.expander("OCR Errors", expanded=False):
+                st.json(ocr_debug.get("errors", {}))
+            with st.expander("Structured Intermediate JSON", expanded=False):
+                st.json(structured_data)
 
 
 if __name__ == "__main__":

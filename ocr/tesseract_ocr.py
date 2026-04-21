@@ -119,7 +119,7 @@ def _score_page(text: str, boxes: Sequence[Dict[str, str]]) -> float:
 
 def run_tesseract_ocr(
     file_path: Path,
-    dpi: int = 300,
+    dpi: int = 220,
     lang: str = "eng",
 ) -> Tuple[str, Optional[List[Dict[str, str]]]]:
     """
@@ -154,7 +154,16 @@ def run_tesseract_ocr(
         best_angle = 0
         best_score = -1.0
 
-        angles = (0,) if is_pdf else (0, 90, 180, 270)
+        # Fast path: run 0-degree first and only explore extra angles when weak.
+        angle0_text, angle0_boxes = _ocr_single_page(image, lang=lang)
+        angle0_score = _score_page(angle0_text, angle0_boxes)
+        best_text = angle0_text
+        best_boxes = angle0_boxes
+        best_angle = 0
+        best_score = angle0_score
+
+        should_try_more = (not is_pdf) and (angle0_score < 40.0)
+        angles = (90, 180, 270) if should_try_more else ()
         for angle in angles:
             rotated = _rotate_bgr(image, angle)
             page_text, page_boxes = _ocr_single_page(rotated, lang=lang)

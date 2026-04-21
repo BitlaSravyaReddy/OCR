@@ -27,6 +27,42 @@ def load_prompt(invoice_type: str) -> str:
     return prompt_file.read_text(encoding="utf-8")
 
 
+def _trim_for_prompt(value: Any, max_rows: int = 40) -> Any:
+    if not isinstance(value, dict):
+        return value
+    out = dict(value)
+    # Do not pass noisy OCR-derived normalized/record fields to LLM.
+    out.pop("normalized_fields", None)
+    out.pop("records", None)
+    rows = out.get("rows")
+    if isinstance(rows, list) and len(rows) > max_rows:
+        out["rows"] = rows[:max_rows]
+    layout = out.get("layout")
+    if isinstance(layout, list) and len(layout) > max_rows:
+        out["layout"] = layout[:max_rows]
+    return out
+
+
+def _trim_boxes_for_prompt(value: Any, limit: int = 100) -> Any:
+    if not isinstance(value, list):
+        return value
+    return value[:limit]
+
+
+def _has_meaningful_structured_data(data: Dict[str, Any]) -> bool:
+    if not isinstance(data, dict):
+        return False
+    for key in ("header", "parties", "totals"):
+        section = data.get(key)
+        if isinstance(section, dict) and any(v not in (None, "", [], {}, "null") for v in section.values()):
+            return True
+    for key in ("products", "expenses"):
+        section = data.get(key)
+        if isinstance(section, list) and len(section) > 0:
+            return True
+    return False
+
+
 def refine_invoice_json_with_llm(
     structured_data: Dict[str, Any],
     extracted_text: str,
@@ -35,6 +71,7 @@ def refine_invoice_json_with_llm(
     openai_model: Optional[str] = None,
     prompt_text: Optional[str] = None,
     party_segmentation: Optional[Dict[str, Any]] = None,
+    raw_ocr_context: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Refine preprocessed intermediate JSON using Gemini.
@@ -44,7 +81,9 @@ def refine_invoice_json_with_llm(
     if model_name.startswith("models/"):
         model_name = model_name[7:]
 
-    message = f"""You are a strict JSON generator for invoice refinement.
+    has_structured_signal = _has_meaningful_structured_data(structured_data)
+
+    message = f"""You are a strict JSON generator for invoice refinement from OCR outputs.
 Output policy (must follow):
 - Output exactly one JSON object.
 - First character must be '{{' and last character must be '}}'.
@@ -64,14 +103,52 @@ Output policy (must follow):
 ```
 
 Rules:
-1) Use preprocessed structured data as the primary source.
-2) Use OCR raw text only to fill missing values.
-3) Preserve monetary values and line items.
-4) Return ONLY valid JSON.
-5) Preserve all product line items from preprocessed data; do not collapse or summarize them.
-6) Keep product quantity/rate/amount/HSN as extracted unless OCR fallback clearly corrects them.
-7) Invoice_Number must NOT be a date. Reject date-like tokens (e.g., 14/03/2026, 3-Nov-2025) for Invoice_Number.
-8) Address fields must contain only postal address text. Exclude logistics/metadata labels like delivery note, despatch, truck, terms, references.
+1) Input is OCR text + OCR-structured JSON, not an image. Infer entities from OCR context only.
+2) Use preprocessed structured data as the primary source.
+3) Use OCR raw text only to fill missing values.
+4) Ignore OCR `normalized_fields` and `records`; they are noisy. Trust rows/layout/raw text evidence.
+5) Identify party entities carefully: company/person names vs address lines must not be mixed.
+6) Preserve monetary values and line items.
+7) Return ONLY valid JSON.
+8) Preserve all product line items from preprocessed data; do not collapse or summarize them.
+9) Keep product quantity/rate/amount/HSN as extracted unless OCR fallback clearly corrects them.
+10) Invoice_Number must NOT be a date. Reject date-like tokens (e.g., 14/03/2026, 3-Nov-2025) for Invoice_Number.
+11) Address fields must contain only postal address text. Exclude logistics/metadata labels like delivery note, despatch, truck, terms, references.
+"""
+    if not has_structured_signal:
+        message += """
+
+Primary source policy:
+- Preprocessed structure is intentionally minimal for this run.
+- Use raw OCR engine evidence (Paddle/Tesseract) as the primary source of truth.
+"""
+    if isinstance(raw_ocr_context, dict):
+        paddle_json = raw_ocr_context.get("paddle_json")
+        paddle_text = raw_ocr_context.get("paddle_text")
+        tesseract_text = raw_ocr_context.get("tesseract_text")
+        tesseract_boxes = raw_ocr_context.get("tesseract_boxes")
+        message += f"""
+
+# Raw OCR Engine Evidence (entity validation):
+Paddle OCR JSON (trimmed):
+```json
+{json.dumps(_trim_for_prompt(paddle_json, max_rows=40), ensure_ascii=False, indent=2)}
+```
+
+Paddle OCR text (trimmed):
+```
+{(paddle_text or "")[:3000]}
+```
+
+Tesseract OCR text (trimmed):
+```
+{(tesseract_text or "")[:3000]}
+```
+
+Tesseract boxes sample (trimmed):
+```json
+{json.dumps(_trim_boxes_for_prompt(tesseract_boxes, limit=100), ensure_ascii=False, indent=2)}
+```
 """
     if party_segmentation:
         message += f"""
@@ -102,6 +179,7 @@ Consistency requirements:
 - productsArray should retain line-item granularity from preprocessed products.
 - Expected minimum productsArray count: {expected_products}
 - Expected minimum Expenses count: {expected_expenses}
+- Include `_meta` object and `tags` array in output.
 """
 
     config = {
@@ -129,8 +207,10 @@ Consistency requirements:
                     "type": "ARRAY",
                     "items": {"type": "OBJECT"},
                 },
+                "_meta": {"type": "OBJECT", "nullable": True},
+                "tags": {"type": "ARRAY", "items": {"type": "STRING"}, "nullable": True},
             },
-            "required": ["productsArray", "Expenses"],
+            "required": ["productsArray", "Expenses", "_meta", "tags"],
         },
     }
 
@@ -748,8 +828,8 @@ def _structured_to_final(structured_data: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "Customer_Name": parties.get("Customer_Name"),
         "SupplierName": parties.get("SupplierName"),
-        "Customer_address": parties.get("Customer_address") or parties.get("Address"),
-        "Supplier_address": parties.get("Supplier_Address") or parties.get("Address"),
+        "Customer_address": parties.get("Customer_address"),
+        "Supplier_address": parties.get("Supplier_Address"),
         "Customer_GSTIN": parties.get("Customer_GSTIN"),
         "Supplier_GST": parties.get("Supplier_GST"),
         "Invoice_Number": header.get("Invoice_Number"),
@@ -834,6 +914,7 @@ def normalize_final_invoice_json(
     extracted_text: str,
 ) -> Dict[str, Any]:
     fallback = _structured_to_final(structured_data)
+    rows = _ocr_rows(structured_data)
     out: Dict[str, Any] = {}
 
     for key in TARGET_TOP_LEVEL_KEYS:
@@ -849,6 +930,10 @@ def normalize_final_invoice_json(
         fallback_value=fallback.get("Invoice_Number"),
         structured_data=structured_data,
     )
+    if _is_date_like_token(str(out.get("Invoice_Number") or "")):
+        out["Invoice_Number"] = None
+    if str(out.get("Invoice_Date") or "").strip() == str(out.get("Invoice_Number") or "").strip():
+        out["Invoice_Number"] = None
 
     # Deterministic total: highest amount seen in OCR text.
     max_amt = _extract_highest_amount(extracted_text or "")
@@ -898,10 +983,25 @@ def normalize_final_invoice_json(
             _extract_customer_address_from_text(extracted_text or "", out.get("Customer_Name"))
         )
 
+    _apply_party_ownership_lock(out, extracted_text or "")
+
+    supplier_from_rows, supplier_addr_rows = _extract_party_block_from_rows(rows, role="supplier")
+    customer_from_rows, customer_addr_rows = _extract_party_block_from_rows(rows, role="customer")
+    if supplier_from_rows:
+        out["SupplierName"] = supplier_from_rows
+    if customer_from_rows:
+        out["Customer_Name"] = customer_from_rows
+    if supplier_addr_rows:
+        out["Supplier_address"] = supplier_addr_rows
+    if customer_addr_rows:
+        out["Customer_address"] = customer_addr_rows
+    out["Supplier_address"] = _format_address_human(out.get("Supplier_address"))
+    out["Customer_address"] = _format_address_human(out.get("Customer_address"))
+
     # Final GST ownership guardrail (never same; customer GST only with customer-side evidence).
     supplier_gst_evidence = _extract_supplier_gst_from_text(extracted_text or "")
     customer_gst_evidence = _extract_customer_gst_from_text(extracted_text or "")
-    supplier_gst = _norm_gst(out.get("Supplier_GST")) or supplier_gst_evidence
+    supplier_gst = supplier_gst_evidence or _norm_gst(out.get("Supplier_GST"))
     out["Supplier_GST"] = supplier_gst
     if customer_gst_evidence and customer_gst_evidence != supplier_gst:
         out["Customer_GSTIN"] = customer_gst_evidence
@@ -911,8 +1011,23 @@ def normalize_final_invoice_json(
     # Standardize products and enforce quantity/rate/amount consistency.
     out["productsArray"] = _normalize_products(out.get("productsArray"), fallback.get("productsArray", []))
     out["Expenses"] = _normalize_expenses(out.get("Expenses"), fallback.get("Expenses", []))
+    row_products = _extract_products_from_rows(rows)
+    if row_products:
+        out["productsArray"] = row_products
+    row_expenses = _extract_expenses_from_rows(rows)
+    if row_expenses:
+        out["Expenses"] = row_expenses
+        out["Total_Expenses"] = round(sum(_to_float(item.get("Expense_Amount")) or 0.0 for item in row_expenses), 2)
+    _apply_tax_guardrails(out, extracted_text or "")
+    _apply_inclusive_tax_product_rule(out, extracted_text or "")
+    out["Bank_Name"] = _resolve_bank_name(
+        current_value=out.get("Bank_Name"),
+        extracted_text=extracted_text or "",
+    )
+    out["IFSCCode"] = _normalize_ifsc(out.get("IFSCCode"))
+    out["Email"] = _normalize_email(out.get("Email"))
     out["_meta"] = _normalize_meta(out.get("_meta"), fallback.get("_meta"))
-    out["tags"] = out.get("tags") if isinstance(out.get("tags"), list) else []
+    out["tags"] = _build_tags(out)
 
     # Mandatory products field.
     if not out["productsArray"]:
@@ -947,7 +1062,9 @@ def _normalize_products(value: Any, fallback_products: Any) -> List[Dict[str, An
         row = dict(raw) if isinstance(raw, dict) else {}
         fixed = {key: _normalize_nullish(row.get(key)) for key in PRODUCT_KEYS}
         name = str(fixed.get("productName") or "").lower()
-        if any(k in name for k in ("output igst", "output cgst", "output sgst", "igst @", "cgst @", "sgst @")):
+        if any(k in name for k in PRODUCT_REJECT_TOKENS):
+            continue
+        if _contains_reject_token(name):
             continue
         _apply_product_fallback_if_unrealistic(fixed, fb)
         _repair_product_numbers(fixed)
@@ -993,6 +1110,10 @@ def _normalize_expenses(value: Any, fallback_expenses: Any) -> List[Dict[str, An
         name = str(fixed.get("Expense_Name") or "").lower()
         if "amount chargeable" in name:
             continue
+        if any(k in name for k in ("cgst", "sgst", "igst", "tax", "% %")):
+            continue
+        if not re.search(r"[a-z]", name):
+            continue
         if amount is not None and amount >= 10_000_000 and not any(k in name for k in ("freight", "fee", "labour", "commission", "round")):
             continue
         items.append(fixed)
@@ -1013,7 +1134,27 @@ def _normalize_meta(value: Any, fallback_meta: Any) -> Dict[str, Any]:
         src.update(value)
     for k, v in base.items():
         src.setdefault(k, v)
+    src["status"] = "Success"
     return src
+
+
+def _format_address_human(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw or raw.lower() in {"null", "none", "na", "n/a"}:
+        return None
+    parts = [re.sub(r"\s+", " ", p).strip(" ,:-|") for p in raw.split("|")]
+    parts = [p for p in parts if p]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} {parts[1]}".strip()
+    head = f"{parts[0]} {parts[1]}".strip()
+    tail = ", ".join(parts[2:])
+    return f"{head}, {tail}".strip(" ,")
 
 
 def _normalize_nullish(value: Any) -> Any:
@@ -1071,10 +1212,9 @@ def _repair_product_numbers(row: Dict[str, Any]) -> None:
     if amt is not None:
         row["Product_Amount"] = amt
 
-    # Fix partial rows using arithmetic consistency.
-    if qty is not None and rate is not None and (amt is None or (qty * rate > 0 and abs((qty * rate) - amt) > max(2.0, 0.08 * abs(qty * rate)))):
-        row["Product_Amount"] = round(qty * rate, 2)
-    elif qty is not None and amt is not None and (rate is None or rate == 0):
+    # Never recompute Product_Amount when extracted amount already exists.
+    # Only fill missing values conservatively.
+    if qty is not None and amt is not None and (rate is None or rate == 0):
         if qty != 0:
             row["Product_Rate"] = round(amt / qty, 2)
     elif rate is not None and amt is not None and (qty is None or qty == 0):
@@ -1305,6 +1445,17 @@ def _is_valid_invoice_token(token: str) -> bool:
     return True
 
 
+def _normalize_compact(value: Any) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+
+def _contains_reject_token(text: str) -> bool:
+    low = text.lower()
+    return any(tok in low for tok in REJECT_LINE_TOKENS)
+
+
 ADDRESS_STOPWORDS = (
     "tax invoice",
     "gst invoice",
@@ -1336,6 +1487,39 @@ ADDRESS_STOPWORDS = (
     "gstin/uin",
 )
 
+REJECT_LINE_TOKENS = (
+    "gst invoice",
+    "tax invoice",
+    "declaration",
+    "e. & o.e",
+    "e&o.e",
+    "ack no",
+    "ack date",
+    "state name",
+    "despatch",
+    "delivery note",
+    "terms of delivery",
+    "bill of lading",
+    "mode/terms of payment",
+    "reference no",
+    "authorised signatory",
+)
+
+PRODUCT_REJECT_TOKENS = (
+    "output igst",
+    "output cgst",
+    "output sgst",
+    "igst @",
+    "cgst @",
+    "sgst @",
+    "tax invoice",
+    "declaration",
+    "amount chargeable",
+    "e. & o.e",
+    "state name",
+    "ack no",
+)
+
 PARTY_LABEL_TOKENS = (
     "consignee",
     "ship to",
@@ -1365,6 +1549,8 @@ ADDRESS_HINT_TOKENS = (
     "village",
     "district",
     "state",
+    "stand",
+    "bus stand",
     "pin",
     "pincode",
     "h.no",
@@ -1393,6 +1579,8 @@ def _is_invalid_party_name(value: Any) -> bool:
     if any(tok in low for tok in PARTY_LABEL_TOKENS):
         return True
     if len(text) < 3:
+        return True
+    if _contains_reject_token(text):
         return True
     if re.search(r"\b(invoice|dated|delivery|reference|terms of)\b", low):
         return True
@@ -1473,11 +1661,17 @@ def _sanitize_address(value: Any) -> Optional[str]:
     text = re.sub(r"\bBuyer'?s?\s+Order\s+No\.?\b[^|]*", " ", text, flags=re.I)
     text = re.sub(r"\bBill\s*to\b", " ", text, flags=re.I)
     text = re.sub(r"\bShip\s*to\b", " ", text, flags=re.I)
+    text = re.sub(r"\b[A-Z0-9]{3,}(?:\/[A-Z0-9-]+)+\b", " ", text)  # invoice-like tokens (e.g. PAC/01101/26-27)
+    text = re.sub(r"\b(?:ph|phone|contact|tel)\s*[:\-]?\s*\+?[0-9,\-\s]{6,}\b", " ", text, flags=re.I)
+    text = re.sub(r"\b\d{1,2}[-/][A-Za-z]{3}[-/]\d{2,4}\b", " ", text, flags=re.I)
+    text = re.sub(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", " ", text, flags=re.I)
     text = text.replace("\n", " | ")
     chunks = [c.strip(" |") for c in text.split("|") if c.strip(" |")]
     clean_chunks: List[str] = []
     for chunk in chunks:
         low = chunk.lower()
+        if _contains_reject_token(chunk):
+            continue
         cut_at: Optional[int] = None
         for stop in ADDRESS_STOPWORDS:
             pos = low.find(stop)
@@ -1493,6 +1687,8 @@ def _sanitize_address(value: Any) -> Optional[str]:
         if re.fullmatch(r"\d+", chunk):
             continue
         if len(chunk) < 4:
+            continue
+        if re.fullmatch(r"[A-Z]{1,3}\d{1,4}", chunk, re.I):
             continue
         if "private limited" in low and not re.search(r"\b(road|rd|street|st|mandi|nagar|sector|block|gate|plot|h\.?no|near)\b", low):
             continue
@@ -1583,6 +1779,7 @@ def _extract_address_candidate(line: str) -> Optional[str]:
     work = f" {line} "
     # Remove known non-address snippets but keep remaining text.
     work = re.sub(r"\bGSTIN(?:/UIN)?\s*[:\-]?\s*[0-9A-Z]{15}\b", " ", work, flags=re.I)
+    work = re.sub(r"\b[A-Z0-9]{3,}(?:\/[A-Z0-9-]+)+\b", " ", work)  # invoice-like ids
     work = re.sub(r"\b\d{1,2}[-/][A-Za-z]{3}[-/]\d{2,4}\b", " ", work, flags=re.I)
     work = re.sub(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", " ", work, flags=re.I)
     work = re.sub(
@@ -1592,6 +1789,7 @@ def _extract_address_candidate(line: str) -> Optional[str]:
         flags=re.I,
     )
     work = re.sub(r"\b(Contact|Phone|E-?Mail|Email)\s*[:\-]?\s*[A-Za-z0-9@+._-]+\b", " ", work, flags=re.I)
+    work = re.sub(r"\b(?:ph|tel)\s*[:\-]?\s*\+?[0-9,\-\s]{6,}\b", " ", work, flags=re.I)
     work = re.sub(r"\s+", " ", work).strip(" ,:-|")
     work = re.sub(r"\s+\d{1,3}$", "", work).strip(" ,:-|")
     if not work:
@@ -1607,7 +1805,7 @@ def _extract_address_candidate(line: str) -> Optional[str]:
         return None
 
     # Keep likely address spans (contain location tokens or uppercase words with spaces).
-    if re.search(r"\b(road|rd|street|st|mandi|nagar|pur|city|dist|near|plot|gate|gali|sector|block|village|tehsil)\b", low):
+    if re.search(r"\b(road|rd|street|st|mandi|nagar|pur|city|dist|near|plot|gate|gali|sector|block|village|tehsil|stand|opp|compound|market|police)\b", low):
         return work
     if re.search(r"\b[A-Z]{2,}\b", work) and " " in work:
         return work
@@ -1615,31 +1813,582 @@ def _extract_address_candidate(line: str) -> Optional[str]:
 
 
 def _extract_supplier_gst_from_text(text: str) -> Optional[str]:
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    for line in lines[:24]:
-        if "gstin" in line.lower():
-            found = re.findall(r"\b[0-9A-Z]{15}\b", line.upper())
-            if found:
-                return found[0]
-    return None
+    return _best_gstin_from_text(text, prefer_customer=False)
 
 
 def _extract_customer_gst_from_text(text: str) -> Optional[str]:
+    return _best_gstin_from_text(text, prefer_customer=True)
+
+
+def _best_gstin_from_text(text: str, prefer_customer: bool) -> Optional[str]:
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    start = None
+    if not lines:
+        return None
+
+    buyer_idx = None
     for i, line in enumerate(lines):
         low = line.lower()
-        if any(k in low for k in ("buyer (bill to)", "buyer", "consignee", "bill to", "ship to")):
-            start = i
+        if any(k in low for k in ("buyer", "bill to", "ship to", "consignee", "customer")):
+            buyer_idx = i
             break
-    if start is None:
+
+    if prefer_customer and buyer_idx is not None:
+        search_lines = lines[buyer_idx : min(len(lines), buyer_idx + 20)]
+    elif not prefer_customer and buyer_idx is not None:
+        search_lines = lines[:buyer_idx]
+    else:
+        search_lines = lines[:40]
+
+    raw_tokens: List[str] = []
+    for line in search_lines:
+        if "gst" not in line.lower() and not re.search(r"\b[0-9A-Z]{15}\b", line.upper()):
+            continue
+        raw_tokens.extend(re.findall(r"\b[0-9A-Z]{15}\b", line.upper()))
+
+    if not raw_tokens:
+        raw_tokens = re.findall(r"\b[0-9A-Z]{15}\b", (text or "").upper())
+    if not raw_tokens:
         return None
-    window = lines[start : min(len(lines), start + 12)]
-    joined = " ".join(window).upper()
-    found = re.findall(r"\b[0-9A-Z]{15}\b", joined)
-    if not found:
+
+    # Try OCR confusion normalization and vote by frequency.
+    expanded: List[str] = []
+    for token in raw_tokens:
+        expanded.extend(_gst_variants(token))
+    votes: Dict[str, int] = {}
+    for token in expanded:
+        if re.fullmatch(r"[0-9A-Z]{15}", token):
+            votes[token] = votes.get(token, 0) + 1
+    if not votes:
         return None
-    return found[0]
+    best = sorted(votes.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)[0][0]
+    return best
+
+
+def _gst_variants(token: str) -> List[str]:
+    t = token.strip().upper()
+    variants = {t}
+    # Common OCR fixes for alnum confusion.
+    repl_map = {"O": "0", "I": "1", "L": "1", "S": "5", "B": "8"}
+    fixed = "".join(repl_map.get(ch, ch) if idx < 2 or idx >= 12 else ch for idx, ch in enumerate(t))
+    variants.add(fixed)
+    # PAN-body confusion seen in OCR (F/P).
+    if len(t) == 15:
+        pan = t[2:12]
+        if "F" in pan:
+            variants.add(t[:2] + pan.replace("F", "P") + t[12:])
+    return list(variants)
+
+
+def _row_text(row: Dict[str, Any]) -> str:
+    if not isinstance(row, dict):
+        return ""
+    return str(row.get("row_text", "") or "").strip()
+
+
+def _ocr_rows(structured_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = structured_data.get("_ocr_rows")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _extract_party_block_from_rows(rows: List[Dict[str, Any]], role: str) -> Tuple[Optional[str], Optional[str]]:
+    if not rows:
+        return None, None
+    lines = [_row_text(row) for row in rows]
+    lows = [line.lower() for line in lines]
+
+    buyer_idx = None
+    for i, low in enumerate(lows[:120]):
+        if any(k in low for k in ("buyer (bill to)", "buyer", "bill to", "ship to", "consignee", "customer")):
+            buyer_idx = i
+            break
+
+    def state_from_line(line: str) -> Optional[str]:
+        m = re.search(r"state\s*name\s*[|:\s]*([A-Za-z ]+)", line, re.I)
+        if not m:
+            return None
+        value = m.group(1)
+        value = re.split(r",\s*code|\bcode\b", value, flags=re.I)[0]
+        value = re.sub(r"\s+", " ", value).strip(" :-|,")
+        return value if value else None
+
+    def is_good_name(line: str) -> bool:
+        cleaned = re.sub(r"\(.*?from.*?\)", " ", line, flags=re.I)
+        cleaned = re.sub(r"\bfrom\b", " ", cleaned, flags=re.I)
+        cleaned = re.sub(r"\b\d{1,2}[-/][A-Za-z]{3}[-/]\d{2,4}\b", " ", cleaned, flags=re.I)
+        cleaned = re.sub(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", " ", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,:-|")
+        low = cleaned.lower()
+        if _contains_reject_token(cleaned):
+            return False
+        if any(k in low for k in ("original", "duplicate", "copy", "recipient")):
+            return False
+        if any(k in low for k in ("irn", "ack", "invoice", "dated", "gstin", "state name", "delivery", "dispatch", "reference", "contact", "email", "tel:")):
+            return False
+        if re.search(r"[0-9]{6,}", cleaned):
+            return False
+        return _is_company_name_candidate(cleaned)
+
+    if role == "customer":
+        if buyer_idx is None:
+            return None, None
+        scan = lines[buyer_idx + 1 : min(len(lines), buyer_idx + 14)]
+        name = None
+        for line in scan:
+            if is_good_name(line):
+                name = line.strip()
+                break
+        addr_parts: List[str] = []
+        name_seen = name is None
+        for line in scan:
+            low = line.lower()
+            if any(stop in low for stop in ("contact", "entact", "person :", "description of goods", "hsn/sac", "si description")):
+                break
+            if any(skip in low for skip in ("dispatch", "delivery note", "dispatched through", "destination")):
+                continue
+            if "gstin" in low:
+                continue
+            if not name_seen:
+                if name and line.strip() == name.strip():
+                    name_seen = True
+                continue
+            # Skip single-token person names like "MANISH".
+            if re.fullmatch(r"[A-Za-z]{3,}", line.strip()):
+                continue
+            if any(k in low for k in ("roadways", "rahul", "parveen")):
+                continue
+            st = state_from_line(line)
+            if st:
+                addr_parts.append(st)
+                continue
+            cand = _extract_address_candidate(line)
+            if cand:
+                addr_parts.append(cand)
+        dedup_addr: List[str] = []
+        for part in addr_parts:
+            if part and part not in dedup_addr:
+                dedup_addr.append(part)
+        address = " | ".join(dedup_addr[:3]) if dedup_addr else None
+        return (name, address)
+
+    # Supplier block: before buyer label only.
+    end = buyer_idx if buyer_idx is not None else min(len(lines), 40)
+    scan = lines[:end]
+    name = None
+    name_idx = None
+    # Prefer business-name line nearest to supplier GST anchor.
+    gst_anchor = None
+    for idx, line in enumerate(scan):
+        if "gstin" in line.lower():
+            gst_anchor = idx
+            break
+    if gst_anchor is not None:
+        start = max(0, gst_anchor - 8)
+        for idx in range(gst_anchor - 1, start - 1, -1):
+            line = scan[idx]
+            if is_good_name(line):
+                name = re.sub(r"\(.*?from.*?\)", " ", line, flags=re.I).strip(" ,:-|")
+                name_idx = idx
+                break
+    if name_idx is None:
+        for idx, line in enumerate(scan):
+            if is_good_name(line):
+                name = re.sub(r"\(.*?from.*?\)", " ", line, flags=re.I).strip(" ,:-|")
+                name_idx = idx
+                break
+    # If a short repeated suffix was selected, prefer a nearby longer business name containing it.
+    if name_idx is not None and name:
+        for j in range(max(0, name_idx - 6), name_idx):
+            prev = re.sub(r"\(.*?from.*?\)", " ", scan[j], flags=re.I).strip(" ,:-|")
+            if not prev or not is_good_name(prev):
+                continue
+            if name.lower() in prev.lower() and len(prev) > len(name):
+                name = prev
+                name_idx = j
+                break
+    if name_idx is None:
+        return None, None
+
+    addr_parts: List[str] = []
+    for line in scan[name_idx + 1 : min(len(scan), name_idx + 12)]:
+        low = line.lower()
+        if any(stop in low for stop in ("buyer", "bill to", "ship to", "consignee", "description of goods", "hsn/sac")):
+            break
+        # Skip repeated company-name lines while collecting address.
+        if is_good_name(line):
+            continue
+        if any(skip in low for skip in ("delivery note", "dispatch", "reference", "invoice no", "dated")):
+            cand = _extract_address_candidate(line)
+            if cand:
+                addr_parts.append(cand)
+            continue
+        if any(skip in low for skip in ("gstin", "contact", "email", "tel:")):
+            continue
+        st = state_from_line(line)
+        if st:
+            addr_parts.append(st)
+            continue
+        cand = _extract_address_candidate(line)
+        if cand:
+            addr_parts.append(cand)
+
+    dedup_addr: List[str] = []
+    for part in addr_parts:
+        if part and part not in dedup_addr:
+            dedup_addr.append(part)
+    address = " | ".join(dedup_addr[:4]) if dedup_addr else None
+    return name, address
+
+
+def _extract_products_from_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+    products: List[Dict[str, Any]] = []
+    in_table = False
+    for row in rows:
+        line = _row_text(row)
+        low = line.lower()
+        if not line:
+            continue
+        if "description of goods" in low and ("qty" in low or "rate" in low):
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        if low.startswith("sgst") or low.startswith("cgst") or low.startswith("round off") or low.startswith("total"):
+            break
+
+        m_serial = re.match(r"^\s*(\d+)\s+(.*)$", line)
+        if not m_serial:
+            # Multiline continuation: append to last product name.
+            if products and not any(k in low for k in ("gst", "hsn", "qty", "rate", "amount")):
+                cont = re.sub(r"^\s*\d+\s*", "", line).strip(" |")
+                # Stop merging when line is numeric-only/summary amount.
+                if re.fullmatch(r"\d{1,3}(?:,\d{2,3})*(?:\.\d+)?", line.strip()):
+                    continue
+                if cont and len(cont) > 1:
+                    prev_name = str(products[-1]["productName"])
+                    m_dec = re.match(r"^\s*(\d+)\s+(.*)$", line.strip())
+                    if prev_name.endswith(".") and m_dec:
+                        # Merge broken token: "20X2." + "5 ASS LONG" -> "20X2.5 ASS LONG"
+                        products[-1]["productName"] = f"{prev_name}{m_dec.group(1)} {m_dec.group(2)}".strip()
+                    else:
+                        products[-1]["productName"] = f"{prev_name} {cont}".strip()
+            continue
+
+        body = m_serial.group(2)
+        hsn_match = re.search(r"\b(\d{6,8})\b", body)
+        if not hsn_match:
+            if products and len(body.strip()) > 1:
+                cont = body.strip(" |")
+                if cont and not any(k in cont.lower() for k in ("sgst", "cgst", "igst", "total")):
+                    prev_name = str(products[-1]["productName"])
+                    lead_num = m_serial.group(1)
+                    if prev_name.endswith(".") and lead_num:
+                        products[-1]["productName"] = f"{prev_name}{lead_num} {cont}".strip()
+                    else:
+                        products[-1]["productName"] = f"{prev_name} {cont}".strip()
+            continue
+
+        desc = body[: hsn_match.start()].strip(" |")
+        parts = [part.strip() for part in body.split("|") if part.strip()]
+        qty = None
+        unit = None
+        rate = None
+        amount = None
+
+        qty_match = re.search(r"\b(\d+(?:\.\d+)?)\s*(pcs|nos|kg|qt|qtl|mt|ltr|unit)\b\.?", body, re.I)
+        if qty_match:
+            qty = _to_float(qty_match.group(1))
+            unit = qty_match.group(2)
+        percents = [_to_float(x) for x in re.findall(r"(\d+(?:\.\d+)?)\s*%", body)]
+        percents = [p for p in percents if p is not None]
+        gst_rate = percents[0] if percents else 0.0
+        dis_per = 0.0
+        if len(percents) >= 2:
+            candidates = [p for p in percents[1:] if p is not None and 0.0 < p <= 25.0]
+            dis_per = (candidates[-1] if candidates else 0.0)
+
+        if len(parts) >= 2:
+            rate_candidates = re.findall(r"\d{1,3}(?:,\d{2,3})*(?:\.\d+)?|\d+(?:\.\d+)?", parts[-2])
+            if rate_candidates:
+                rate = _to_float(rate_candidates[0])
+        amt_candidates = re.findall(r"\d{1,3}(?:,\d{2,3})*(?:\.\d+)?|\d+(?:\.\d+)?", parts[-1] if parts else "")
+        if amt_candidates:
+            amount = _to_float(amt_candidates[-1])
+
+        if not desc or amount is None:
+            continue
+        products.append(
+            {
+                "productName": re.sub(r"\s+", " ", desc).strip(),
+                "Product_HSN_code": hsn_match.group(1),
+                "Product_GST_Rate": gst_rate if gst_rate is not None else 0.0,
+                "Product_Quantity": qty if qty is not None else 0.0,
+                "Product_Rate": rate if rate is not None else 0.0,
+                "Product_Unit": unit or "Nos",
+                "Product_DisPer": dis_per,
+                "Product_Amount": amount,
+                "Product_Description": "null",
+                "Product_BatchNo": "null",
+                "Product_ExpDate": "null",
+                "Product_MfgDate": "null",
+                "Product_MRP": 0.0,
+            }
+        )
+    return products
+
+
+def _extract_expenses_from_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+    expenses: List[Dict[str, Any]] = []
+    seen_tax_line = False
+    for row in rows:
+        line = _row_text(row)
+        low = line.lower()
+        if not line:
+            continue
+        if low.startswith("sgst") or low.startswith("cgst") or low.startswith("igst"):
+            seen_tax_line = True
+            continue
+        if not seen_tax_line:
+            continue
+        if low.startswith("total"):
+            break
+        nums = re.findall(r"\d{1,3}(?:,\d{2,3})*(?:\.\d+)?|\d+(?:\.\d+)?", line)
+        if not nums:
+            continue
+        amount = _to_float(nums[-1])
+        if amount is None:
+            continue
+        pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+        pct = _to_float(pct_match.group(1)) if pct_match else 0.0
+        name = re.sub(r"\|", " ", line)
+        name = re.sub(r"\d{1,3}(?:,\d{2,3})*(?:\.\d+)?|\d+(?:\.\d+)?", " ", name)
+        name = re.sub(r"\s+", " ", name).strip(" :-")
+        if not name:
+            continue
+        low_name = name.lower()
+        if any(k in low_name for k in ("cgst", "sgst", "igst", "tax", "total")):
+            continue
+        if not re.search(r"[a-z]", low_name):
+            continue
+        expenses.append(
+            {
+                "Expense_Name": name,
+                "Expense_Percentage": pct if pct is not None else 0.0,
+                "Expense_Amount": amount,
+            }
+        )
+    return expenses
+
+def _extract_tax_amounts_from_text(text: str) -> Dict[str, float]:
+    values: Dict[str, float] = {}
+    if not text:
+        return values
+    for line in text.splitlines():
+        low = line.lower()
+        compact = re.sub(r"\s+", "", low)
+        if "sgst" in compact:
+            amt = _largest_amount_in_line(line)
+            if amt is not None:
+                values["SGST_Amount"] = amt
+        if "cgst" in compact:
+            amt = _largest_amount_in_line(line)
+            if amt is not None:
+                values["CGST_Amount"] = amt
+        if "igst" in compact:
+            amt = _largest_amount_in_line(line)
+            if amt is not None:
+                values["IGST_Amount"] = amt
+    return values
+
+
+def _largest_amount_in_line(line: str) -> Optional[float]:
+    nums = re.findall(r"\d{1,3}(?:,\d{2,3})*(?:\.\d+)?|\d+(?:\.\d+)?", line)
+    values: List[float] = []
+    for token in nums:
+        val = _to_float(token)
+        if val is None:
+            continue
+        if val < 1:
+            continue
+        digit_count = len(re.sub(r"\D", "", token))
+        if digit_count > 9 and "," not in token and "." not in token:
+            # likely account/HSN/id-like token
+            continue
+        values.append(val)
+    if not values:
+        return None
+    return max(values)
+
+
+def _collect_hsn_candidates(products: Any) -> set[str]:
+    out: set[str] = set()
+    if not isinstance(products, list):
+        return out
+    for row in products:
+        if not isinstance(row, dict):
+            continue
+        hsn = row.get("Product_HSN_code")
+        if hsn is None:
+            continue
+        digits = re.sub(r"\D", "", str(hsn))
+        if 4 <= len(digits) <= 10:
+            out.add(digits)
+    return out
+
+
+def _apply_tax_guardrails(out: Dict[str, Any], extracted_text: str) -> None:
+    tax_from_labels = _extract_tax_amounts_from_text(extracted_text)
+    hsn_set = _collect_hsn_candidates(out.get("productsArray"))
+    for field in ("SGST_Amount", "CGST_Amount", "IGST_Amount"):
+        if field in tax_from_labels:
+            out[field] = tax_from_labels[field]
+            continue
+        current = out.get(field)
+        if current is None:
+            out[field] = 0.0
+            continue
+        val = _to_float(current)
+        if val is None:
+            out[field] = 0.0
+            continue
+        digits = re.sub(r"\D", "", str(current))
+        if digits in hsn_set:
+            # Hard rule: HSN must never populate tax amounts.
+            out[field] = 0.0
+            continue
+        # No clear tax-line evidence -> keep conservative default.
+        out[field] = 0.0
+
+    sgst = _to_float(out.get("SGST_Amount")) or 0.0
+    cgst = _to_float(out.get("CGST_Amount")) or 0.0
+    igst = _to_float(out.get("IGST_Amount")) or 0.0
+    # Intra-state sanity: SGST and CGST should match when IGST is not applied.
+    if igst == 0.0:
+        if sgst > 0 and cgst == 0:
+            out["CGST_Amount"] = sgst
+        elif cgst > 0 and sgst == 0:
+            out["SGST_Amount"] = cgst
+        elif sgst > 0 and cgst > 0 and abs(sgst - cgst) > 0.01:
+            fixed = max(sgst, cgst)
+            out["SGST_Amount"] = fixed
+            out["CGST_Amount"] = fixed
+
+
+def _extract_tax_rate_pair(text: str) -> Tuple[float, float]:
+    sgst_rate = 0.0
+    cgst_rate = 0.0
+    for line in (text or "").splitlines():
+        low = line.lower()
+        compact = re.sub(r"\s+", "", low)
+        if "sgst" in compact:
+            m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+            if m:
+                sgst_rate = _to_float(m.group(1)) or sgst_rate
+        if "cgst" in compact:
+            m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+            if m:
+                cgst_rate = _to_float(m.group(1)) or cgst_rate
+    return sgst_rate, cgst_rate
+
+
+def _apply_inclusive_tax_product_rule(out: Dict[str, Any], extracted_text: str) -> None:
+    products = out.get("productsArray")
+    if not isinstance(products, list):
+        return
+    incl_tax = "incl. of tax" in extracted_text.lower() or "incl of tax" in extracted_text.lower()
+    sgst_rate, cgst_rate = _extract_tax_rate_pair(extracted_text)
+    derived_gst = round((sgst_rate + cgst_rate), 2) if (sgst_rate > 0 and cgst_rate > 0) else 0.0
+    if derived_gst == 0.0:
+        sgst_amt = _to_float(out.get("SGST_Amount")) or 0.0
+        cgst_amt = _to_float(out.get("CGST_Amount")) or 0.0
+        taxable = _to_float(out.get("Taxable_Amount")) or 0.0
+        if taxable <= 0:
+            taxable = sum((_to_float(item.get("Product_Amount")) or 0.0) for item in products if isinstance(item, dict))
+        if taxable > 0 and (sgst_amt + cgst_amt) > 0:
+            derived_gst = round(((sgst_amt + cgst_amt) / taxable) * 100.0, 2)
+
+    for row in products:
+        if not isinstance(row, dict):
+            continue
+        qty = _to_float(row.get("Product_Quantity"))
+        amt = _to_float(row.get("Product_Amount"))
+        rate = _to_float(row.get("Product_Rate"))
+        gst = _to_float(row.get("Product_GST_Rate")) or 0.0
+        taxable_total = _to_float(out.get("Taxable_Amount")) or 0.0
+
+        if incl_tax and qty not in (None, 0) and amt not in (None, 0):
+            row["Product_Rate"] = round(amt / qty, 2)
+        elif rate in (None, 0) and qty not in (None, 0) and amt not in (None, 0):
+            row["Product_Rate"] = round(amt / qty, 2)
+
+        # If OCR placed taxable unit-rate into amount field (common in "Incl. of Tax" layouts), swap.
+        if incl_tax and qty not in (None, 0) and amt not in (None, 0) and taxable_total > 0:
+            if abs((amt * qty) - taxable_total) <= max(5.0, 0.03 * taxable_total):
+                row["Product_Rate"] = round(amt, 2)
+                row["Product_Amount"] = round(taxable_total, 2)
+
+        if derived_gst > 0 and (gst == 0.0 or gst < derived_gst):
+            row["Product_GST_Rate"] = derived_gst
+
+
+def _resolve_bank_name(current_value: Any, extracted_text: str) -> Optional[str]:
+    lines = [ln.strip() for ln in extracted_text.splitlines() if ln.strip()]
+    bank_lines = [ln for ln in lines if re.search(r"\bbank\s*name\s*:|\bbank\s*:", ln, re.I)]
+
+    def pick_from_lines(src_lines: List[str]) -> Optional[str]:
+        for line in src_lines:
+            if _contains_reject_token(line):
+                continue
+            m = re.search(r"\bbank(?:\s*name)?\s*:\s*([A-Za-z][A-Za-z&.\s]{1,40}?)(?=\s+A\/?C\b|\s+ACCOUNT\b|\s+IFSC\b|$)", line, re.I)
+            if not m:
+                continue
+            candidate = re.sub(r"\s+", " ", m.group(1)).strip(" :-|")
+            candidate = re.split(r"\b(a/c|account|ifsc|branch)\b", candidate, flags=re.I)[0].strip(" :-|")
+            if candidate:
+                return candidate
+        return None
+
+    from_text = pick_from_lines(bank_lines)
+    if from_text:
+        return from_text
+
+    current = str(current_value).strip() if current_value is not None else ""
+    if not current or current.lower() in {"null", "none", "na", "n/a"}:
+        return None
+    if "bank" not in current.lower():
+        return None
+    return current
+
+
+def _apply_party_ownership_lock(out: Dict[str, Any], extracted_text: str) -> None:
+    supplier_name = out.get("SupplierName")
+    customer_name = out.get("Customer_Name")
+    supplier_addr = out.get("Supplier_address")
+    customer_addr = out.get("Customer_address")
+
+    if _is_invalid_party_name(supplier_name):
+        out["SupplierName"] = None
+    if _is_invalid_party_name(customer_name):
+        out["Customer_Name"] = None
+
+    s_addr_norm = _normalize_compact(supplier_addr)
+    c_addr_norm = _normalize_compact(customer_addr)
+    if s_addr_norm and c_addr_norm and s_addr_norm == c_addr_norm:
+        # Avoid cross-copy contamination.
+        out["Customer_address"] = None
+
+    if out.get("Customer_address"):
+        ca = str(out["Customer_address"]).lower()
+        # If customer anchor is absent in OCR text, keep conservative null.
+        if not any(k in extracted_text.lower() for k in ("buyer", "bill to", "ship to", "consignee", "customer")):
+            out["Customer_address"] = None
+        elif any(k in ca for k in ("supplier", "seller")):
+            out["Customer_address"] = None
 
 
 TOP_STRING_FIELDS = {
@@ -1760,3 +2509,50 @@ def _to_float_or_zero(value: Any) -> float:
         return float(text)
     except ValueError:
         return 0.0
+
+
+def _normalize_ifsc(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    if not text or text.lower() in {"null", "none", "na", "n/a"}:
+        return None
+    text = re.sub(r"[^A-Z0-9]", "", text)
+    text = text.replace("OOO", "000").replace("OO", "00")
+    if len(text) == 11 and re.fullmatch(r"[A-Z]{4}0[A-Z0-9]{6}", text):
+        return text
+    return None
+
+
+def _normalize_email(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"null", "none", "na", "n/a"}:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text):
+        return None
+    return text
+
+
+def _build_tags(out: Dict[str, Any]) -> List[str]:
+    party = _to_string_or_null_literal(out.get("SupplierName"))
+    gstin = _to_string_or_null_literal(out.get("Supplier_GST"))
+    hs_codes = 0
+    products = out.get("productsArray")
+    if isinstance(products, list):
+        seen = set()
+        for row in products:
+            if not isinstance(row, dict):
+                continue
+            code = _to_string_or_null_literal(row.get("Product_HSN_code"))
+            if code != "null":
+                seen.add(code)
+        hs_codes = len(seen)
+    return [
+        "Doc:invoice",
+        f"Party:{party}",
+        f"GSTIN:{gstin}",
+        "FY:Unknown",
+        f"HS:{hs_codes}",
+    ]

@@ -1,12 +1,15 @@
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 import logging
+import os
 
 import cv2
 
 from ocr_pipeline import HybridOCR, OCRPageResult, StructuredExtractor
 
 LOGGER = logging.getLogger(__name__)
+_STRUCTURER = StructuredExtractor()
+_EXTRACTOR_CACHE: Dict[str, HybridOCR] = {}
 
 
 def _rotate_bgr(image: Any, angle: int) -> Any:
@@ -31,13 +34,25 @@ def run_paddle_ocr(
     Run PaddleOCR-based extraction and return (structured_json, extracted_text).
     For image uploads, tries 0/90/180/270 and picks best-scoring candidate.
     """
-    langs = list(languages) if languages else ["en", "hi"]
-    extractor = HybridOCR(
-        languages=langs,
-        render_dpi=pdf_dpi,
-        min_token_confidence=min_token_confidence,
-    )
-    structurer = StructuredExtractor()
+    if languages:
+        langs = [lang.strip() for lang in languages if str(lang).strip()]
+    else:
+        configured = os.getenv("PADDLE_OCR_LANGS", "en")
+        langs = [part.strip() for part in configured.split(",") if part.strip()]
+        if not langs:
+            langs = ["en"]
+    cache_key = f"{','.join(sorted(langs))}|{int(pdf_dpi)}|{float(min_token_confidence):.3f}"
+    extractor = _EXTRACTOR_CACHE.get(cache_key)
+    if extractor is None:
+        extractor = HybridOCR(
+            languages=langs,
+            render_dpi=pdf_dpi,
+            min_token_confidence=min_token_confidence,
+        )
+        _EXTRACTOR_CACHE[cache_key] = extractor
+        LOGGER.info("Paddle extractor cache miss | key=%s", cache_key)
+    else:
+        LOGGER.info("Paddle extractor cache hit | key=%s", cache_key)
 
     if file_path.suffix.lower() == ".pdf":
         pages = extractor.process_pdf_pages(file_path)
@@ -49,14 +64,23 @@ def run_paddle_ocr(
         best_candidate = None
         best_angle = 0
         best_score = -1.0
-        for angle in (0, 90, 180, 270):
-            rotated = _rotate_bgr(image, angle)
-            candidate = extractor.ocr_image(rotated, source_label=f"{file_path.name}:rot{angle}")
-            score = float(getattr(candidate, "ranking_score", 0.0))
-            if score > best_score:
-                best_score = score
-                best_candidate = candidate
-                best_angle = angle
+
+        # Fast path: run 0-degree first; only try other angles when confidence is weak.
+        candidate_0 = extractor.ocr_image(image, source_label=f"{file_path.name}:rot0")
+        score_0 = float(getattr(candidate_0, "ranking_score", 0.0))
+        best_candidate = candidate_0
+        best_angle = 0
+        best_score = score_0
+
+        if score_0 < 0.72:
+            for angle in (90, 180, 270):
+                rotated = _rotate_bgr(image, angle)
+                candidate = extractor.ocr_image(rotated, source_label=f"{file_path.name}:rot{angle}")
+                score = float(getattr(candidate, "ranking_score", 0.0))
+                if score > best_score:
+                    best_score = score
+                    best_candidate = candidate
+                    best_angle = angle
 
         if best_candidate is None:
             pages = extractor.process_image_pages(file_path)
@@ -80,6 +104,5 @@ def run_paddle_ocr(
             ]
 
     extracted_text = "\n\n".join(page.text for page in pages if page.text)
-    extracted_json = structurer.extract_document_structure(file_path, pages)
+    extracted_json = _STRUCTURER.extract_document_structure(file_path, pages)
     return extracted_json, extracted_text
-

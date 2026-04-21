@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import logging
+import time
 
 from ocr.fusion import fuse_ocr_outputs
 from ocr.paddle_ocr import run_paddle_ocr
@@ -18,7 +19,7 @@ def supported_upload_extensions() -> List[str]:
 def run_multi_ocr(
     file_path: Path,
     languages: Optional[Sequence[str]] = None,
-    pdf_dpi: int = 300,
+    pdf_dpi: int = 220,
     min_token_confidence: float = 0.20,
     tesseract_lang: str = "eng",
 ) -> Tuple[Dict[str, Any], str, Dict[str, Any]]:
@@ -31,6 +32,7 @@ def run_multi_ocr(
     tesseract_text = ""
     tesseract_boxes: Optional[List[Dict[str, str]]] = None
     errors: Dict[str, str] = {}
+    start_ts = time.perf_counter()
     LOGGER.info("Multi-OCR start | file=%s", file_path)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -112,10 +114,11 @@ def run_multi_ocr(
         "errors": errors,
     }
     LOGGER.info(
-        "Multi-OCR complete | file=%s | fused_text_len=%s | has_errors=%s",
+        "Multi-OCR complete | file=%s | fused_text_len=%s | has_errors=%s | duration_sec=%.2f",
         file_path,
         len(fused_text or ""),
         bool(errors),
+        time.perf_counter() - start_ts,
     )
     return fused_json, fused_text, debug_payload
 
@@ -123,7 +126,7 @@ def run_multi_ocr(
 def run_ocr(
     file_path: Path,
     languages: Optional[Sequence[str]] = None,
-    pdf_dpi: int = 300,
+    pdf_dpi: int = 220,
     min_token_confidence: float = 0.20,
     tesseract_lang: str = "eng",
 ) -> Tuple[Dict[str, Any], str]:
