@@ -11,6 +11,7 @@ import pytesseract
 from PIL import Image
 
 LOGGER = logging.getLogger(__name__)
+_TESSERACT_AVAILABILITY: Optional[Tuple[bool, str]] = None
 
 
 def _resolve_tesseract_cmd() -> str:
@@ -39,6 +40,28 @@ def _resolve_tesseract_cmd() -> str:
             return candidate
 
     return "tesseract"
+
+
+def _get_tesseract_version_once(resolved_cmd: str) -> str:
+    global _TESSERACT_AVAILABILITY
+    if _TESSERACT_AVAILABILITY is not None:
+        available, message = _TESSERACT_AVAILABILITY
+        if available:
+            return message
+        raise RuntimeError(message)
+
+    try:
+        version = str(pytesseract.get_tesseract_version())
+    except Exception as exc:  # noqa: BLE001
+        message = (
+            "Tesseract is not installed or not available on PATH "
+            f"(resolved_cmd={resolved_cmd}). PaddleOCR will be used without Tesseract assist."
+        )
+        _TESSERACT_AVAILABILITY = (False, message)
+        raise RuntimeError(message) from exc
+
+    _TESSERACT_AVAILABILITY = (True, version)
+    return version
 
 
 def _render_pdf_pages(pdf_path: Path, dpi: int) -> List[np.ndarray]:
@@ -138,7 +161,7 @@ def run_tesseract_ocr(
     )
 
     # Explicit availability check to produce a clear failure reason in debug payload.
-    version = str(pytesseract.get_tesseract_version())
+    version = _get_tesseract_version_once(resolved_cmd)
     LOGGER.info("Tesseract detected | version=%s", version)
 
     images = _load_images(file_path, dpi=dpi)

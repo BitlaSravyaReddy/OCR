@@ -1,487 +1,728 @@
+import os
+import argparse
+import csv
+import html
 import json
-import tempfile
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
 import logging
+import shutil
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import streamlit as st
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+os.environ.setdefault("PADDLE_PDX_EAGER_INIT", "False")
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
 
-from llm.refine import normalize_final_invoice_json, refine_invoice_json_with_llm
-from ocr.ocr_pipeline import run_multi_ocr, supported_upload_extensions
+from llm.refine import load_prompt, normalize_final_invoice_json, refine_invoice_json_with_llm
+from ocr.ocr_pipeline import run_multi_ocr
 from preprocessing.preprocess import preprocess_invoice
 
 
-st.set_page_config(page_title="Invoice Extraction System", layout="wide")
+LOGGER = logging.getLogger("batch_pipeline")
 
-if not logging.getLogger().handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def _log_step(
+    index: int,
+    total: int,
+    invoice_type: str,
+    file_path: Path,
+    step: str,
+    status: str,
+    extra: str = "",
+) -> None:
+    suffix = f" | {extra}" if extra else ""
+    msg = (
+        f"[{index}/{total}] {step.upper()} {status.upper()} | "
+        f"type={invoice_type} | file={str(file_path)}{suffix}"
     )
-else:
-    logging.getLogger().setLevel(logging.INFO)
-
-LOGGER = logging.getLogger(__name__)
-PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+    LOGGER.info(msg)
+    print(msg, flush=True)
 
 
-def _extract_summary_fields(final_json: Dict[str, Any]) -> Tuple[Optional[Any], Optional[Any]]:
-    invoice_number = final_json.get("Invoice_Number")
-    total_amount = final_json.get("Total_Amount")
-    return invoice_number, total_amount
+def _discover_files(folder: Path) -> List[Path]:
+    files: List[Path] = []
+    if not folder.exists() or not folder.is_dir():
+        return files
+    for path in sorted(folder.rglob("*")):
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            files.append(path)
+    return files
 
 
-TOP_STRING_FIELDS = {
-    "Customer_Name",
-    "SupplierName",
-    "Customer_address",
-    "Supplier_address",
-    "Customer_GSTIN",
-    "Supplier_GST",
-    "Invoice_Number",
-    "Invoice_Date",
-    "Vehicle_Number",
-    "Bank_Name",
-    "bank_account_number",
-    "IFSCCode",
-    "Email",
-    "Phone",
-    "Supplier_First_Word",
-}
-
-TOP_NUMERIC_FIELDS = {
-    "SGST_Amount",
-    "CGST_Amount",
-    "IGST_Amount",
-    "Total_Expenses",
-    "Taxable_Amount",
-    "Total_Amount",
-}
-
-PRODUCT_STRING_FIELDS = {
-    "productName",
-    "Product_HSN_code",
-    "Product_Unit",
-    "Product_Description",
-    "Product_BatchNo",
-    "Product_ExpDate",
-    "Product_MfgDate",
-}
-
-PRODUCT_NUMERIC_FIELDS = {
-    "Product_GST_Rate",
-    "Product_Quantity",
-    "Product_Rate",
-    "Product_DisPer",
-    "Product_Amount",
-    "Product_MRP",
-}
-
-EXPENSE_STRING_FIELDS = {"Expense_Name"}
-EXPENSE_NUMERIC_FIELDS = {"Expense_Percentage", "Expense_Amount"}
+def _safe_json_write(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+def _safe_text_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
 
 
-def _audit_datatypes(final_json: Dict[str, Any]) -> Dict[str, Any]:
-    violations: list[dict[str, Any]] = []
+def _extract_admin_fields(final_json: Dict[str, Any]) -> Dict[str, Any]:
+    products = final_json.get("productsArray", [])
+    expenses = final_json.get("Expenses", [])
+    return {
+        "invoice_number": final_json.get("Invoice_Number"),
+        "invoice_date": final_json.get("Invoice_Date"),
+        "supplier_name": final_json.get("SupplierName"),
+        "customer_name": final_json.get("Customer_Name"),
+        "supplier_gst": final_json.get("Supplier_GST"),
+        "customer_gst": final_json.get("Customer_GSTIN"),
+        "taxable_amount": final_json.get("Taxable_Amount"),
+        "total_amount": final_json.get("Total_Amount"),
+        "products_count": len(products) if isinstance(products, list) else 0,
+        "expenses_count": len(expenses) if isinstance(expenses, list) else 0,
+    }
 
-    for key in TOP_STRING_FIELDS:
-        value = final_json.get(key)
-        if not isinstance(value, str):
-            violations.append({"field": key, "expected": "string", "actual_type": type(value).__name__, "value": value})
 
-    for key in TOP_NUMERIC_FIELDS:
-        value = final_json.get(key)
-        if not _is_number(value):
-            violations.append({"field": key, "expected": "number", "actual_type": type(value).__name__, "value": value})
+def _prepare_llm_context(ocr_debug: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    paddle_payload = ocr_debug.get("paddle", {}) if isinstance(ocr_debug, dict) else {}
+    paddle_json = paddle_payload.get("json") if isinstance(paddle_payload, dict) else {}
+    paddle_text = paddle_payload.get("text") if isinstance(paddle_payload, dict) else ""
+    tess_payload = ocr_debug.get("tesseract", {}) if isinstance(ocr_debug, dict) else {}
+    tesseract_text = tess_payload.get("text") if isinstance(tess_payload, dict) else ""
+    raw_ocr_context = {
+        "paddle_json": paddle_json,
+        "paddle_text": paddle_text,
+        "tesseract_text": tesseract_text,
+        "tesseract_boxes": tess_payload.get("boxes") if isinstance(tess_payload, dict) else None,
+    }
+    llm_context_text = "\n".join(part for part in [paddle_text, tesseract_text] if isinstance(part, str) and part.strip())
+    return raw_ocr_context, llm_context_text
 
-    products = final_json.get("productsArray")
-    if not isinstance(products, list):
-        violations.append({"field": "productsArray", "expected": "list", "actual_type": type(products).__name__, "value": products})
-        products = []
-    for idx, item in enumerate(products):
-        if not isinstance(item, dict):
-            violations.append({"field": f"productsArray[{idx}]", "expected": "object", "actual_type": type(item).__name__, "value": item})
+
+def _safe_text_len(value: Any) -> int:
+    return len(str(value or "").strip())
+
+
+def _ocr_rows_text_len(rows: Any) -> int:
+    if not isinstance(rows, list):
+        return 0
+    total = 0
+    for row in rows:
+        if not isinstance(row, dict):
             continue
-        for key in PRODUCT_STRING_FIELDS:
-            value = item.get(key)
-            if not isinstance(value, str):
-                violations.append(
-                    {"field": f"productsArray[{idx}].{key}", "expected": "string", "actual_type": type(value).__name__, "value": value}
-                )
-        for key in PRODUCT_NUMERIC_FIELDS:
-            value = item.get(key)
-            if not _is_number(value):
-                violations.append(
-                    {"field": f"productsArray[{idx}].{key}", "expected": "number", "actual_type": type(value).__name__, "value": value}
-                )
+        total += _safe_text_len(row.get("row_text") or row.get("text"))
+    return total
 
-    expenses = final_json.get("Expenses")
-    if not isinstance(expenses, list):
-        violations.append({"field": "Expenses", "expected": "list", "actual_type": type(expenses).__name__, "value": expenses})
-        expenses = []
-    for idx, item in enumerate(expenses):
-        if not isinstance(item, dict):
-            violations.append({"field": f"Expenses[{idx}]", "expected": "object", "actual_type": type(item).__name__, "value": item})
+
+def _has_meaningful_ocr(extracted_json: Any, extracted_text: Any, ocr_debug: Any) -> bool:
+    """Require real OCR signal before asking the LLM to invent structure."""
+    if _safe_text_len(extracted_text) >= 20:
+        return True
+
+    if isinstance(extracted_json, dict):
+        if _safe_text_len(extracted_json.get("text")) >= 20:
+            return True
+        if _ocr_rows_text_len(extracted_json.get("rows")) >= 20:
+            return True
+
+    if not isinstance(ocr_debug, dict):
+        return False
+
+    for source_key in ("paddle", "tesseract", "fused"):
+        source = ocr_debug.get(source_key, {})
+        if not isinstance(source, dict):
             continue
-        for key in EXPENSE_STRING_FIELDS:
-            value = item.get(key)
-            if not isinstance(value, str):
-                violations.append(
-                    {"field": f"Expenses[{idx}].{key}", "expected": "string", "actual_type": type(value).__name__, "value": value}
-                )
-        for key in EXPENSE_NUMERIC_FIELDS:
-            value = item.get(key)
-            if not _is_number(value):
-                violations.append(
-                    {"field": f"Expenses[{idx}].{key}", "expected": "number", "actual_type": type(value).__name__, "value": value}
-                )
+        if _safe_text_len(source.get("text")) >= 20:
+            return True
+        source_json = source.get("json")
+        if isinstance(source_json, dict):
+            if _safe_text_len(source_json.get("text")) >= 20:
+                return True
+            if _ocr_rows_text_len(source_json.get("rows")) >= 20:
+                return True
+    return False
+
+
+def _ocr_error_summary(ocr_debug: Any) -> str:
+    if not isinstance(ocr_debug, dict):
+        return "no OCR debug payload"
+    errors = ocr_debug.get("errors")
+    if not isinstance(errors, dict) or not errors:
+        return "no usable OCR text was extracted"
+    return "; ".join(f"{key}: {value}" for key, value in errors.items())
+
+
+def process_invoice_file(
+    file_path: Path,
+    invoice_type: str,
+    out_json_path: Path,
+    debug_json_path: Path,
+    index: int,
+    total: int,
+) -> Dict[str, Any]:
+    started = time.perf_counter()
+    out_json_path.parent.mkdir(parents=True, exist_ok=True)
+    debug_json_path.parent.mkdir(parents=True, exist_ok=True)
+    ocr_debug: Dict[str, Any] = {}
+
+    start_msg = f"[{index}/{total}] START FILE | type={invoice_type} | file={str(file_path)}"
+    LOGGER.info(start_msg)
+    print(start_msg, flush=True)
+    if index == 1:
+        warmup_msg = "NOTE: First file may take longer due OCR model warmup (Paddle init + cache load)."
+        LOGGER.info(warmup_msg)
+        print(warmup_msg, flush=True)
+
+    try:
+        ocr_started = time.perf_counter()
+        _log_step(index, total, invoice_type, file_path, "OCR", "start")
+        extracted_json, extracted_text, ocr_debug = run_multi_ocr(file_path)
+        ocr_ms = int((time.perf_counter() - ocr_started) * 1000)
+        paddle_rows = 0
+        paddle_payload_dbg = ocr_debug.get("paddle", {}) if isinstance(ocr_debug, dict) else {}
+        paddle_json_dbg = paddle_payload_dbg.get("json") if isinstance(paddle_payload_dbg, dict) else {}
+        if isinstance(paddle_json_dbg, dict) and isinstance(paddle_json_dbg.get("rows"), list):
+            paddle_rows = len(paddle_json_dbg.get("rows", []))
+
+        if not _has_meaningful_ocr(extracted_json, extracted_text, ocr_debug):
+            raise RuntimeError(
+                "OCR failed: no usable text from PaddleOCR or Tesseract. "
+                f"Details: {_ocr_error_summary(ocr_debug)}"
+            )
+
+        _log_step(
+            index,
+            total,
+            invoice_type,
+            file_path,
+            "OCR",
+            "done",
+            extra=f"ocr_ms={ocr_ms} | fused_text_chars={len(extracted_text or '')} | paddle_rows={paddle_rows}",
+        )
+
+        pre_started = time.perf_counter()
+        _log_step(index, total, invoice_type, file_path, "PREPROCESS", "start")
+        print(f"[{index}/{total}] PREPROCESSING OCR output -> structured zones/fields...", flush=True)
+        structured_data = preprocess_invoice(extracted_json=extracted_json, extracted_text=extracted_text)
+        pre_ms = int((time.perf_counter() - pre_started) * 1000)
+        if not isinstance(structured_data, dict):
+            structured_data = {}
+        products_count = len(structured_data.get("products", [])) if isinstance(structured_data.get("products"), list) else 0
+        expenses_count = len(structured_data.get("expenses", [])) if isinstance(structured_data.get("expenses"), list) else 0
+        _log_step(
+            index,
+            total,
+            invoice_type,
+            file_path,
+            "PREPROCESS",
+            "done",
+            extra=f"pre_ms={pre_ms} | products={products_count} | expenses={expenses_count}",
+        )
+
+        paddle_payload = ocr_debug.get("paddle", {}) if isinstance(ocr_debug, dict) else {}
+        paddle_json = paddle_payload.get("json") if isinstance(paddle_payload, dict) else {}
+        if isinstance(paddle_json, dict):
+            structured_data.setdefault("_ocr_rows", paddle_json.get("rows", []))
+            structured_data.setdefault("_ocr_layout", paddle_json.get("layout", []))
+
+        raw_ocr_context, llm_context_text = _prepare_llm_context(ocr_debug)
+        prompt_text = load_prompt(invoice_type)
+
+        llm_started = time.perf_counter()
+        _log_step(index, total, invoice_type, file_path, "LLM", "start")
+        print(f"[{index}/{total}] REFINING with LLM (remove ambiguities, map entities, enforce schema)...", flush=True)
+        llm_output = refine_invoice_json_with_llm(
+            structured_data=structured_data,
+            extracted_text=llm_context_text,
+            invoice_type=invoice_type,
+            prompt_text=prompt_text,
+            party_segmentation=None,
+            raw_ocr_context=raw_ocr_context,
+        )
+        llm_ms = int((time.perf_counter() - llm_started) * 1000)
+
+        if llm_output is None:
+            final_json = normalize_final_invoice_json({}, structured_data, llm_context_text)
+            llm_status = "fallback"
+            print(f"[{index}/{total}] LLM returned fallback path, normalizing deterministic output...", flush=True)
+        else:
+            final_json = normalize_final_invoice_json(llm_output, structured_data, llm_context_text)
+            llm_status = "success"
+            print(f"[{index}/{total}] LLM refinement success, normalizing final JSON...", flush=True)
+        _log_step(
+            index,
+            total,
+            invoice_type,
+            file_path,
+            "LLM",
+            "done",
+            extra=f"llm={llm_status} | llm_ms={llm_ms}",
+        )
+
+        if not isinstance(final_json.get("productsArray"), list) or not final_json.get("productsArray"):
+            final_json["productsArray"] = [
+                {
+                    "productName": p.get("productName"),
+                    "Product_HSN_code": p.get("HSN"),
+                    "Product_Quantity": p.get("quantity"),
+                    "Product_Unit": p.get("unit"),
+                    "Product_Rate": p.get("rate"),
+                    "Product_Amount": p.get("amount"),
+                }
+                for p in structured_data.get("products", [])
+                if isinstance(p, dict)
+            ]
+
+        save_started = time.perf_counter()
+        _log_step(index, total, invoice_type, file_path, "SAVE", "start", extra=f"out={out_json_path}")
+        print(f"[{index}/{total}] GENERATING FINAL JSON -> {str(out_json_path)}", flush=True)
+        _safe_json_write(out_json_path, final_json)
+        _safe_json_write(
+            debug_json_path,
+            {
+                "invoice_type": invoice_type,
+                "source_file": str(file_path),
+                "ocr_debug": ocr_debug,
+                "structured_data": structured_data,
+                "llm_status": llm_status,
+            },
+        )
+        save_ms = int((time.perf_counter() - save_started) * 1000)
+        _log_step(
+            index,
+            total,
+            invoice_type,
+            file_path,
+            "SAVE",
+            "done",
+            extra=f"save_ms={save_ms} | debug={debug_json_path}",
+        )
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        done_msg = f"[{index}/{total}] DONE FILE | type={invoice_type} | file={str(file_path)} | llm={llm_status} | total_ms={duration_ms}"
+        LOGGER.info(done_msg)
+        print(done_msg, flush=True)
+        return {
+            "status": "success",
+            "file": str(file_path),
+            "output_json": str(out_json_path),
+            "debug_json": str(debug_json_path),
+            "llm_status": llm_status,
+            "duration_ms": duration_ms,
+            "ocr_ms": ocr_ms,
+            "preprocess_ms": pre_ms,
+            "llm_ms": llm_ms,
+            "save_ms": save_ms,
+            "paddle_rows": paddle_rows,
+            "fused_text_chars": len(extracted_text or ""),
+            "admin_fields": _extract_admin_fields(final_json),
+        }
+    except Exception as exc:  # noqa: BLE001
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        fail_msg = f"[{index}/{total}] FAILED FILE | type={invoice_type} | file={str(file_path)} | total_ms={duration_ms} | error={exc}"
+        LOGGER.error(fail_msg, exc_info=LOGGER.isEnabledFor(logging.DEBUG))
+        print(fail_msg, flush=True)
+        error_payload = {
+            "status": "error",
+            "file": str(file_path),
+            "output_json": None,
+            "debug_json": None,
+            "error": str(exc),
+            "duration_ms": duration_ms,
+            "ocr_debug": ocr_debug,
+            "admin_fields": {},
+        }
+        error_debug_path = debug_json_path.with_name(f"{debug_json_path.stem}_error.json")
+        error_payload["debug_json"] = str(error_debug_path)
+        _safe_json_write(error_debug_path, error_payload)
+        return error_payload
+
+
+def _process_file(
+    file_path: Path,
+    invoice_type: str,
+    output_dir: Path,
+    debug_dir: Path,
+    index: int,
+    total: int,
+) -> Dict[str, Any]:
+    base = file_path.stem
+    out_json_path = output_dir / f"{base}_final.json"
+    debug_json_path = debug_dir / f"{base}_debug.json"
+    return process_invoice_file(
+        file_path=file_path,
+        invoice_type=invoice_type,
+        out_json_path=out_json_path,
+        debug_json_path=debug_json_path,
+        index=index,
+        total=total,
+    )
+
+
+def _run_group(input_folder: Path, invoice_type: str, output_dir: Path, debug_dir: Path) -> Dict[str, Any]:
+    files = _discover_files(input_folder)
+    LOGGER.info("Group start | type=%s | folder=%s | files=%d", invoice_type, input_folder, len(files))
+    print(f"GROUP START | type={invoice_type} | folder={str(input_folder)} | files={len(files)}", flush=True)
+    for i, p in enumerate(files, start=1):
+        print(f"  queued[{i}/{len(files)}]: {str(p)}", flush=True)
+    group_started = time.perf_counter()
+    results: List[Dict[str, Any]] = []
+    for idx, path in enumerate(files, start=1):
+        result = _process_file(path, invoice_type, output_dir, debug_dir, idx, len(files))
+        results.append(result)
+        success_so_far = sum(1 for r in results if r.get("status") == "success")
+        elapsed = time.perf_counter() - group_started
+        avg_per_file = elapsed / max(1, idx)
+        remaining = int(avg_per_file * max(0, len(files) - idx))
+        LOGGER.info(
+            "Progress | type=%s | done=%d/%d | success=%d | failed=%d | eta_sec=%d",
+            invoice_type,
+            idx,
+            len(files),
+            success_so_far,
+            idx - success_so_far,
+            remaining,
+        )
+        print(
+            f"PROGRESS | type={invoice_type} | done={idx}/{len(files)} | success={success_so_far} | failed={idx - success_so_far} | eta_sec={remaining}",
+            flush=True,
+        )
+    success = sum(1 for r in results if r.get("status") == "success")
+    failed = len(results) - success
+    summary = {
+        "invoice_type": invoice_type,
+        "input_folder": str(input_folder),
+        "output_folder": str(output_dir),
+        "debug_folder": str(debug_dir),
+        "total_files": len(files),
+        "success": success,
+        "failed": failed,
+        "results": results,
+    }
+    LOGGER.info("Group done | type=%s | total=%d | success=%d | failed=%d", invoice_type, len(files), success, failed)
+    print(f"GROUP DONE | type={invoice_type} | total={len(files)} | success={success} | failed={failed}", flush=True)
+    return summary
+
+
+def _flatten_admin_rows(final_summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for section_key in ("purchase", "sales"):
+        section = final_summary.get(section_key, {})
+        if not isinstance(section, dict):
+            continue
+        invoice_type = section.get("invoice_type")
+        for result in section.get("results", []):
+            if not isinstance(result, dict):
+                continue
+            admin_fields = result.get("admin_fields", {}) if isinstance(result.get("admin_fields"), dict) else {}
+            rows.append(
+                {
+                    "group": section_key,
+                    "invoice_type": invoice_type,
+                    "status": result.get("status"),
+                    "file": result.get("file"),
+                    "output_json": result.get("output_json"),
+                    "debug_json": result.get("debug_json"),
+                    "llm_status": result.get("llm_status"),
+                    "duration_ms": result.get("duration_ms"),
+                    "ocr_ms": result.get("ocr_ms"),
+                    "preprocess_ms": result.get("preprocess_ms"),
+                    "llm_ms": result.get("llm_ms"),
+                    "save_ms": result.get("save_ms"),
+                    "paddle_rows": result.get("paddle_rows"),
+                    "fused_text_chars": result.get("fused_text_chars"),
+                    "invoice_number": admin_fields.get("invoice_number"),
+                    "invoice_date": admin_fields.get("invoice_date"),
+                    "supplier_name": admin_fields.get("supplier_name"),
+                    "customer_name": admin_fields.get("customer_name"),
+                    "supplier_gst": admin_fields.get("supplier_gst"),
+                    "customer_gst": admin_fields.get("customer_gst"),
+                    "taxable_amount": admin_fields.get("taxable_amount"),
+                    "total_amount": admin_fields.get("total_amount"),
+                    "products_count": admin_fields.get("products_count"),
+                    "expenses_count": admin_fields.get("expenses_count"),
+                    "error": result.get("error"),
+                }
+            )
+    return rows
+
+
+def _write_admin_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "group",
+        "invoice_type",
+        "status",
+        "file",
+        "output_json",
+        "debug_json",
+        "llm_status",
+        "duration_ms",
+        "ocr_ms",
+        "preprocess_ms",
+        "llm_ms",
+        "save_ms",
+        "paddle_rows",
+        "fused_text_chars",
+        "invoice_number",
+        "invoice_date",
+        "supplier_name",
+        "customer_name",
+        "supplier_gst",
+        "customer_gst",
+        "taxable_amount",
+        "total_amount",
+        "products_count",
+        "expenses_count",
+        "error",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _render_admin_html(final_summary: Dict[str, Any], rows: List[Dict[str, Any]], generated_at: str) -> str:
+    purchase = final_summary.get("purchase", {}) if isinstance(final_summary.get("purchase"), dict) else {}
+    sales = final_summary.get("sales", {}) if isinstance(final_summary.get("sales"), dict) else {}
+    total_files = len(rows)
+    success = sum(1 for row in rows if row.get("status") == "success")
+    failed = total_files - success
+    fallback = sum(1 for row in rows if row.get("llm_status") == "fallback")
+    success_llm = sum(1 for row in rows if row.get("llm_status") == "success")
+    slowest = sorted(rows, key=lambda row: row.get("duration_ms") or 0, reverse=True)[:10]
+
+    def _metric_card(label: str, value: Any) -> str:
+        return (
+            "<div class='card'>"
+            f"<div class='label'>{html.escape(str(label))}</div>"
+            f"<div class='value'>{html.escape(str(value))}</div>"
+            "</div>"
+        )
+
+    table_rows = []
+    for row in rows:
+        table_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('invoice_type') or ''))}</td>"
+            f"<td>{html.escape(str(Path(str(row.get('file') or '')).name))}</td>"
+            f"<td>{html.escape(str(row.get('status') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('llm_status') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('invoice_number') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('supplier_name') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('customer_name') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('total_amount') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('duration_ms') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('output_json') or ''))}</td>"
+            "</tr>"
+        )
+
+    slow_rows = []
+    for row in slowest:
+        slow_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(Path(str(row.get('file') or '')).name))}</td>"
+            f"<td>{html.escape(str(row.get('invoice_type') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('duration_ms') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('ocr_ms') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('llm_ms') or ''))}</td>"
+            "</tr>"
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Admin Monitoring Dashboard</title>
+  <style>
+    body {{ font-family: Segoe UI, Arial, sans-serif; margin: 24px; background: #f6f8fb; color: #1f2937; }}
+    h1, h2 {{ margin-bottom: 8px; }}
+    .muted {{ color: #6b7280; margin-bottom: 20px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(4, minmax(160px, 1fr)); gap: 12px; margin: 18px 0 28px; }}
+    .card {{ background: white; border-radius: 12px; padding: 16px; box-shadow: 0 2px 10px rgba(0,0,0,0.06); }}
+    .label {{ font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: .04em; }}
+    .value {{ font-size: 28px; font-weight: 700; margin-top: 8px; }}
+    table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 12px; overflow: hidden; margin-bottom: 24px; }}
+    th, td {{ padding: 10px 12px; border-bottom: 1px solid #e5e7eb; text-align: left; font-size: 13px; }}
+    th {{ background: #111827; color: white; position: sticky; top: 0; }}
+    tr:nth-child(even) td {{ background: #f9fafb; }}
+    .section {{ margin-top: 28px; }}
+  </style>
+</head>
+<body>
+  <h1>Admin Monitoring Dashboard</h1>
+  <div class="muted">Generated at: {html.escape(generated_at)}</div>
+
+  <div class="grid">
+    {_metric_card("Total Files", total_files)}
+    {_metric_card("Success", success)}
+    {_metric_card("Failed", failed)}
+    {_metric_card("LLM Fallback", fallback)}
+    {_metric_card("LLM Success", success_llm)}
+    {_metric_card("Purchase Files", purchase.get("total_files", 0))}
+    {_metric_card("Sales Files", sales.get("total_files", 0))}
+    {_metric_card("Run Duration (ms)", final_summary.get("duration_ms", 0))}
+  </div>
+
+  <div class="section">
+    <h2>Processed Files</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Invoice Type</th>
+          <th>File</th>
+          <th>Status</th>
+          <th>LLM</th>
+          <th>Invoice No</th>
+          <th>Supplier</th>
+          <th>Customer</th>
+          <th>Total Amount</th>
+          <th>Duration (ms)</th>
+          <th>Output JSON</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(table_rows)}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>Slowest Files</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>File</th>
+          <th>Invoice Type</th>
+          <th>Total (ms)</th>
+          <th>OCR (ms)</th>
+          <th>LLM (ms)</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(slow_rows)}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
+"""
+
+
+def _write_admin_monitoring(root: Path, admin_dir: Path, final_summary: Dict[str, Any]) -> Dict[str, str]:
+    admin_dir.mkdir(parents=True, exist_ok=True)
+    run_id = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    run_dir = admin_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    rows = _flatten_admin_rows(final_summary)
+
+    summary_json = run_dir / "summary.json"
+    manifest_csv = run_dir / "processed_files.csv"
+    dashboard_html = run_dir / "dashboard.html"
+    latest_json = admin_dir / "latest_summary.json"
+    latest_csv = admin_dir / "latest_processed_files.csv"
+    latest_html = admin_dir / "latest_dashboard.html"
+
+    _safe_json_write(summary_json, final_summary)
+    _write_admin_csv(manifest_csv, rows)
+    html_text = _render_admin_html(final_summary, rows, generated_at=run_id)
+    _safe_text_write(dashboard_html, html_text)
+
+    _safe_json_write(latest_json, final_summary)
+    _write_admin_csv(latest_csv, rows)
+    _safe_text_write(latest_html, html_text)
 
     return {
-        "ok": len(violations) == 0,
-        "violation_count": len(violations),
-        "violations": violations,
+        "run_dir": str(run_dir),
+        "summary_json": str(summary_json),
+        "manifest_csv": str(manifest_csv),
+        "dashboard_html": str(dashboard_html),
+        "latest_summary_json": str(latest_json),
+        "latest_manifest_csv": str(latest_csv),
+        "latest_dashboard_html": str(latest_html),
     }
 
 
-def _load_prompt_from_prompts_dir(invoice_type: str) -> str:
-    file_name = "Purchase_Invoice.txt" if invoice_type == "Purchase Invoice" else "Sales_Invoice.txt"
-    prompt_file = PROMPTS_DIR / file_name
-    if not prompt_file.exists():
-        raise FileNotFoundError(f"Prompt file not found: {prompt_file}")
-    LOGGER.info("app.py using prompt file: %s", prompt_file)
-    return prompt_file.read_text(encoding="utf-8")
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Automatic folder-driven invoice batch processing pipeline")
+    parser.add_argument("--purchase-dir", default="PURCHASE", help="Input folder for purchase invoices")
+    parser.add_argument("--sales-dir", default="SALES", help="Input folder for sales invoices")
+    parser.add_argument("--sales-dir-fallback", default="SALE", help="Fallback sales input folder if SALES does not exist")
+    parser.add_argument("--purchase-out", default="PURCHASE_JSON", help="Output folder for purchase JSONs (root-level)")
+    parser.add_argument("--purchase-debug-out", default="PURCHASE_DEBUG", help="Debug folder for purchase artifacts (root-level)")
+    parser.add_argument("--sales-out", default="SALES_JSON", help="Output folder for sales JSONs (root-level)")
+    parser.add_argument("--sales-debug-out", default="SALES_DEBUG", help="Debug folder for sales artifacts (root-level)")
+    parser.add_argument("--admin-out", default="ADMIN_MONITORING", help="Admin monitoring folder for summaries, CSVs, and dashboard")
+    parser.add_argument("--summary-file", default="batch_summary.json", help="Summary JSON path (root-level)")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Terminal log level")
+    parser.add_argument("--log-file", default=None, help="Optional log file path in project root")
+    return parser.parse_args(argv)
 
 
-def _render_debug_downloads(uploaded_name: str, ocr_debug: Dict[str, Any]) -> None:
-    base_name = Path(uploaded_name).stem
-    paddle_payload = ocr_debug.get("paddle", {}) if isinstance(ocr_debug, dict) else {}
-    tesseract_payload = ocr_debug.get("tesseract", {}) if isinstance(ocr_debug, dict) else {}
-    fused_payload = ocr_debug.get("fused", {}) if isinstance(ocr_debug, dict) else {}
-    errors_payload = ocr_debug.get("errors", {}) if isinstance(ocr_debug, dict) else {}
+def _setup_logging(log_level: str, log_file: Optional[str]) -> None:
+    level = getattr(logging, str(log_level).upper(), logging.INFO)
+    fmt = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.setLevel(level)
 
-    st.download_button(
-        label="Download Paddle OCR JSON",
-        data=json.dumps(paddle_payload.get("json", {}), ensure_ascii=False, indent=2),
-        file_name=f"{base_name}_paddle.json",
-        mime="application/json",
-    )
-    st.download_button(
-        label="Download Paddle OCR Text",
-        data=str(paddle_payload.get("text", "") or ""),
-        file_name=f"{base_name}_paddle.txt",
-        mime="text/plain",
-    )
-    st.download_button(
-        label="Download Tesseract OCR JSON",
-        data=json.dumps(
-            {
-                "text": tesseract_payload.get("text", ""),
-                "boxes": tesseract_payload.get("boxes"),
-                "text_length": tesseract_payload.get("text_length"),
-                "boxes_count": tesseract_payload.get("boxes_count"),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        file_name=f"{base_name}_tesseract.json",
-        mime="application/json",
-    )
-    st.download_button(
-        label="Download Fused OCR JSON",
-        data=json.dumps(fused_payload.get("json", {}), ensure_ascii=False, indent=2),
-        file_name=f"{base_name}_fused.json",
-        mime="application/json",
-    )
-    st.download_button(
-        label="Download Fused OCR Text",
-        data=str(fused_payload.get("text", "") or ""),
-        file_name=f"{base_name}_fused.txt",
-        mime="text/plain",
-    )
-    st.download_button(
-        label="Download OCR Errors JSON",
-        data=json.dumps(errors_payload, ensure_ascii=False, indent=2),
-        file_name=f"{base_name}_ocr_errors.json",
-        mime="application/json",
-    )
+    # Keep terminal output focused on our explicit print() progress lines.
+    # Console logging is reserved for warnings/errors from libraries.
+    console = logging.StreamHandler()
+    console.setLevel(logging.WARNING)
+    console.setFormatter(logging.Formatter(fmt))
+    root.addHandler(console)
+
+    if isinstance(log_file, str) and log_file.strip():
+        log_path = Path(__file__).resolve().parent / log_file.strip()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(level)
+        file_handler.setFormatter(logging.Formatter(fmt))
+        root.addHandler(file_handler)
+        LOGGER.info("Logging to file: %s", log_path)
+
+    logging.getLogger("pytesseract").setLevel(logging.WARNING)
 
 
-def _render_structure_debug_panel(structured_data: Dict[str, Any]) -> None:
-    structure_debug = structured_data.get("_structure_debug", {}) if isinstance(structured_data, dict) else {}
-    blocks = structure_debug.get("blocks", []) if isinstance(structure_debug, dict) else []
-    products = structured_data.get("products", []) if isinstance(structured_data, dict) else []
-    expenses = structured_data.get("expenses", []) if isinstance(structured_data, dict) else []
-    totals = structured_data.get("totals", {}) if isinstance(structured_data, dict) else {}
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    _setup_logging(args.log_level, args.log_file)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Detected Blocks", len(blocks) if isinstance(blocks, list) else 0)
-    c2.metric("Extracted Products", len(products) if isinstance(products, list) else 0)
-    c3.metric("Extracted Expenses", len(expenses) if isinstance(expenses, list) else 0)
+    root = Path(__file__).resolve().parent
+    purchase_in = root / args.purchase_dir
+    sales_in = root / args.sales_dir
+    if not sales_in.exists():
+        fallback = root / args.sales_dir_fallback
+        if fallback.exists():
+            sales_in = fallback
 
-    st.markdown("**Block Labels**")
-    if isinstance(blocks, list) and blocks:
-        st.dataframe(blocks, use_container_width=True)
-    else:
-        st.info("No structure blocks detected.")
+    purchase_out = root / args.purchase_out
+    purchase_debug_out = root / args.purchase_debug_out
+    sales_out = root / args.sales_out
+    sales_debug_out = root / args.sales_debug_out
+    admin_out = root / args.admin_out
 
-    st.markdown("**Extracted Table Rows (Products)**")
-    if isinstance(products, list) and products:
-        st.dataframe(products, use_container_width=True)
-    else:
-        st.info("No product rows extracted.")
+    started = time.perf_counter()
+    purchase_summary = _run_group(purchase_in, "Purchase Invoice", purchase_out, purchase_debug_out)
+    sales_summary = _run_group(sales_in, "Sales Invoice", sales_out, sales_debug_out)
+    total_ms = int((time.perf_counter() - started) * 1000)
 
-    st.markdown("**Extracted Summary (Expenses + Totals)**")
-    summary_payload = {
-        "expenses": expenses if isinstance(expenses, list) else [],
-        "totals": totals if isinstance(totals, dict) else {},
+    final_summary = {
+        "status": "completed",
+        "root": str(root),
+        "duration_ms": total_ms,
+        "purchase": purchase_summary,
+        "sales": sales_summary,
     }
-    st.json(summary_payload)
-
-
-def _render_party_debug_panel(structured_data: Dict[str, Any], llm_context_text: str, raw_ocr_context: Dict[str, Any]) -> None:
-    parties = structured_data.get("parties", {}) if isinstance(structured_data, dict) else {}
-    supplier_candidates = parties.get("_supplier_candidates", []) if isinstance(parties, dict) else []
-    customer_candidates = parties.get("_customer_candidates", []) if isinstance(parties, dict) else []
-
-    st.markdown("**Selected Party Fields (Pre-LLM)**")
-    st.json(
-        {
-            "SupplierName": parties.get("SupplierName"),
-            "Customer_Name": parties.get("Customer_Name"),
-            "Supplier_GST": parties.get("Supplier_GST"),
-            "Customer_GSTIN": parties.get("Customer_GSTIN"),
-            "Supplier_Address": parties.get("Supplier_Address"),
-            "Customer_address": parties.get("Customer_address"),
-        }
-    )
-
-    st.markdown("**Ranked Party Candidates (Block-Level)**")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.write("Supplier Candidates")
-        st.json(supplier_candidates if isinstance(supplier_candidates, list) else [])
-    with c2:
-        st.write("Customer Candidates")
-        st.json(customer_candidates if isinstance(customer_candidates, list) else [])
-
-    st.markdown("**Compact Party Evidence Sent To LLM**")
-    st.json(
-        {
-            "supplier_candidates": supplier_candidates[:3] if isinstance(supplier_candidates, list) else [],
-            "customer_candidates": customer_candidates[:3] if isinstance(customer_candidates, list) else [],
-            "supplier_gst": parties.get("Supplier_GST"),
-            "customer_gst": parties.get("Customer_GSTIN"),
-        }
-    )
-
-    st.markdown("**Raw OCR Context Snapshot**")
-    paddle_rows = 0
-    if isinstance(raw_ocr_context, dict):
-        paddle_json = raw_ocr_context.get("paddle_json")
-        if isinstance(paddle_json, dict) and isinstance(paddle_json.get("rows"), list):
-            paddle_rows = len(paddle_json.get("rows", []))
-    st.json(
-        {
-            "paddle_rows": paddle_rows,
-            "paddle_text_chars": len(str(raw_ocr_context.get("paddle_text", "") or "")) if isinstance(raw_ocr_context, dict) else 0,
-            "tesseract_text_chars": len(str(raw_ocr_context.get("tesseract_text", "") or "")) if isinstance(raw_ocr_context, dict) else 0,
-            "llm_context_chars": len(llm_context_text or ""),
-        }
-    )
-    st.code((llm_context_text or "")[:2000], language="text")
-
-
-@st.cache_data(show_spinner=False)
-def _cached_multi_ocr(
-    file_bytes: bytes,
-    suffix: str,
-    cache_version: str = "multi_ocr_v4",
-) -> Tuple[Dict[str, Any], str, Dict[str, Any]]:
-    """
-    Cached OCR pass for repeated uploads of the same file.
-    """
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(file_bytes)
-        path = Path(tmp.name)
-    try:
-        fused_json, fused_text, debug_payload = run_multi_ocr(path)
-        return fused_json, fused_text, debug_payload
-    finally:
-        if path.exists():
-            try:
-                path.unlink()
-            except OSError:
-                pass
-
-
-def main() -> None:
-    st.title("Invoice Extraction System")
-    if "last_run" not in st.session_state:
-        st.session_state["last_run"] = None
-
-    with st.container():
-        uploaded_file = st.file_uploader(
-            "Upload Invoice (PDF/Image)",
-            type=supported_upload_extensions(),
-            accept_multiple_files=False,
-        )
-        invoice_type = st.selectbox(
-            "Select Invoice Type",
-            options=["Purchase Invoice", "Sales Invoice"],
-            index=0,
-        )
-        show_debug = st.toggle("Show intermediate steps", value=False)
-
-    if st.button("Process Invoice", type="primary"):
-        if uploaded_file is None:
-            st.error("Please upload a PDF or image invoice before processing.")
-            return
-
-        step_status = st.empty()
-        with st.spinner("Processing invoice..."):
-            try:
-                file_bytes = uploaded_file.getbuffer().tobytes()
-                suffix = Path(uploaded_file.name).suffix or ".bin"
-
-                step_status.info("Running OCR...")
-                extracted_json, extracted_text, ocr_debug = _cached_multi_ocr(file_bytes, suffix, "multi_ocr_v4")
-                if not extracted_json and not extracted_text:
-                    st.error("OCR failed: no text/data could be extracted from the file.")
-                    return
-
-                paddle_payload = ocr_debug.get("paddle", {}) if isinstance(ocr_debug, dict) else {}
-                paddle_json = paddle_payload.get("json") if isinstance(paddle_payload, dict) else None
-                paddle_text = paddle_payload.get("text") if isinstance(paddle_payload, dict) else ""
-                tesseract_payload = ocr_debug.get("tesseract", {}) if isinstance(ocr_debug, dict) else {}
-                tesseract_text = tesseract_payload.get("text") if isinstance(tesseract_payload, dict) else ""
-                step_status.info("Building deterministic structure...")
-                structured_data = preprocess_invoice(extracted_json=extracted_json, extracted_text=extracted_text)
-                if not isinstance(structured_data, dict):
-                    structured_data = {}
-                structured_data.setdefault("_ocr_rows", paddle_json.get("rows", []) if isinstance(paddle_json, dict) else [])
-                structured_data.setdefault("_ocr_layout", paddle_json.get("layout", []) if isinstance(paddle_json, dict) else [])
-
-                # Pass raw OCR engine outputs to LLM for better entity resolution.
-                raw_ocr_context = {
-                    "paddle_json": paddle_json,
-                    "paddle_text": paddle_text,
-                    "tesseract_text": tesseract_text,
-                    "tesseract_boxes": tesseract_payload.get("boxes") if isinstance(tesseract_payload, dict) else None,
-                }
-                llm_context_text = "\n".join(part for part in [paddle_text, tesseract_text] if part)
-
-                step_status.info("Resolving ambiguities with LLM...")
-                prompt_text = _load_prompt_from_prompts_dir(invoice_type)
-                llm_output = refine_invoice_json_with_llm(
-                    structured_data=structured_data,
-                    extracted_text=llm_context_text,
-                    invoice_type=invoice_type,
-                    prompt_text=prompt_text,
-                    party_segmentation=None,
-                    raw_ocr_context=raw_ocr_context,
-                )
-
-                if llm_output is None:
-                    st.warning(
-                        "LLM refinement returned non-JSON response. "
-                        "Showing structured preprocessed JSON fallback (check terminal logs for LLM parse details)."
-                    )
-                    final_json = normalize_final_invoice_json({}, structured_data, llm_context_text)
-                else:
-                    final_json = normalize_final_invoice_json(llm_output, structured_data, llm_context_text)
-
-                # Final UI guardrail: every invoice must have product details.
-                if not isinstance(final_json.get("productsArray"), list) or len(final_json.get("productsArray", [])) == 0:
-                    final_json["productsArray"] = [
-                        {
-                            "productName": p.get("productName"),
-                            "Product_HSN_code": p.get("HSN"),
-                            "Product_Quantity": p.get("quantity"),
-                            "Product_Unit": p.get("unit"),
-                            "Product_Rate": p.get("rate"),
-                            "Product_Amount": p.get("amount"),
-                        }
-                        for p in structured_data.get("products", [])
-                        if isinstance(p, dict)
-                    ]
-                if not final_json.get("productsArray"):
-                    st.error("Product details are mandatory but could not be extracted. Please review OCR quality.")
-                    return
-
-                st.session_state["last_run"] = {
-                    "uploaded_name": uploaded_file.name,
-                    "final_json": final_json,
-                    "ocr_debug": ocr_debug,
-                    "structured_data": structured_data,
-                    "raw_ocr_context": raw_ocr_context,
-                    "llm_context_text": llm_context_text,
-                    "show_debug": show_debug,
-                }
-
-                step_status.success("Processing complete.")
-
-            except FileNotFoundError as exc:
-                st.error(f"Prompt loading failed: {exc}")
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Processing failed: {exc}")
-
-    last_run = st.session_state.get("last_run")
-    if isinstance(last_run, dict):
-        final_json = last_run.get("final_json", {})
-        ocr_debug = last_run.get("ocr_debug", {})
-        structured_data = last_run.get("structured_data", {})
-        raw_ocr_context = last_run.get("raw_ocr_context", {})
-        llm_context_text = str(last_run.get("llm_context_text") or "")
-        uploaded_name = str(last_run.get("uploaded_name") or "invoice")
-        debug_enabled = bool(last_run.get("show_debug", False))
-
-        invoice_number, total_amount = _extract_summary_fields(final_json)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Invoice Number", str(invoice_number) if invoice_number is not None else "N/A")
-        with c2:
-            st.metric("Total Amount", str(total_amount) if total_amount is not None else "N/A")
-
-        st.subheader("Final Structured JSON")
-        st.json(final_json)
-
-        audit = _audit_datatypes(final_json)
-        with st.expander("Datatype Audit", expanded=not audit["ok"]):
-            if audit["ok"]:
-                st.success("Datatype contract check passed.")
-            else:
-                st.warning(f"Datatype violations found: {audit['violation_count']}")
-                st.json(audit["violations"])
-
-        st.download_button(
-            label="Download JSON",
-            data=json.dumps(final_json, ensure_ascii=False, indent=2),
-            file_name=f"{Path(uploaded_name).stem}_final.json",
-            mime="application/json",
-        )
-        with st.expander("Download OCR Artifacts", expanded=False):
-            _render_debug_downloads(uploaded_name, ocr_debug)
-
-        if debug_enabled:
-            with st.expander("Paddle OCR Output", expanded=False):
-                st.json(ocr_debug.get("paddle", {}))
-            with st.expander("Tesseract OCR Output", expanded=False):
-                st.json(ocr_debug.get("tesseract", {}))
-            with st.expander("Fused OCR Output", expanded=False):
-                st.json(ocr_debug.get("fused", {}))
-            with st.expander("OCR Errors", expanded=False):
-                st.json(ocr_debug.get("errors", {}))
-            with st.expander("Structure Engine Blocks", expanded=False):
-                _render_structure_debug_panel(structured_data)
-            with st.expander("Party Segmentation + LLM Context", expanded=False):
-                _render_party_debug_panel(structured_data, llm_context_text, raw_ocr_context)
-            with st.expander("Structured Intermediate JSON", expanded=False):
-                st.json(structured_data)
+    _safe_json_write(root / args.summary_file, final_summary)
+    admin_artifacts = _write_admin_monitoring(root, admin_out, final_summary)
+    final_summary["admin_monitoring"] = admin_artifacts
+    _safe_json_write(root / args.summary_file, final_summary)
+    LOGGER.info("Batch complete | summary=%s | duration_ms=%d", root / args.summary_file, total_ms)
+    print(f"ADMIN DASHBOARD | {admin_artifacts['latest_dashboard_html']}", flush=True)
+    print(f"ADMIN CSV | {admin_artifacts['latest_manifest_csv']}", flush=True)
+    print(f"BATCH COMPLETE | summary={str(root / args.summary_file)} | duration_ms={total_ms}", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

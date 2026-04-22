@@ -2,7 +2,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import logging
+import os
 import time
+
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+os.environ.setdefault("PADDLE_PDX_EAGER_INIT", "False")
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
 
 from ocr.fusion import fuse_ocr_outputs
 from ocr.paddle_ocr import run_paddle_ocr
@@ -76,7 +81,7 @@ def run_multi_ocr(
                 LOGGER.warning("Tesseract OCR returned empty text | file=%s", file_path)
         except Exception as exc:  # noqa: BLE001
             errors["tesseract"] = str(exc)
-            LOGGER.exception("Tesseract OCR failed | file=%s | error=%s", file_path, exc)
+            LOGGER.warning("Tesseract OCR failed | file=%s | error=%s", file_path, exc)
             tesseract_text, tesseract_boxes = "", None
 
     # Fallback safety rules: never break pipeline.

@@ -20,6 +20,16 @@ NOISE_LINE_TOKENS = (
     "reference",
 )
 
+GLOBAL_NOISE_PATTERNS = (
+    re.compile(r"\birn\b", re.I),
+    re.compile(r"\back\s*no\b", re.I),
+    re.compile(r"\bmsme\b", re.I),
+    re.compile(r"\bqr\s*code\b", re.I),
+    re.compile(r"\bterms\s*&?\s*condition", re.I),
+    re.compile(r"\bdeclaration\b", re.I),
+    re.compile(r"\bthis is a computer generated", re.I),
+)
+
 DROP_LINE_PATTERNS = (
     re.compile(r"\birn\b", re.I),
     re.compile(r"\back\b", re.I),
@@ -83,19 +93,44 @@ class Block:
 class StructureEngine:
     def __init__(self) -> None:
         self._table_stop = ("sub total", "subtotal", "cgst", "sgst", "igst", "g. total", "g total", "grand total", "total")
-        self._header_split_tokens = ("invoice no", "invoice number", "dated", "date")
+        self._header_split_tokens = (
+            "invoice no",
+            "invoice number",
+            "dated",
+            "date",
+            "p.o. no",
+            "p.o no",
+            "po no",
+            "p.o. date",
+            "challan no",
+            "bill pay status",
+            "pay. mode",
+            "pay mode",
+            "bill credit",
+            "due date",
+            "delivery by",
+            "lr no",
+            "last transaction",
+            "old balance",
+            "adding this invoice amount",
+            "new balance",
+        )
+        self._buyer_anchor_tokens = ("buyer", "bill to", "consignee", "customer", "m/s")
+        self._table_anchor_tokens = ("description", "qty", "quantity", "rate", "amount", "hsn", "sac")
+        self._totals_anchor_tokens = ("taxable amt", "taxable amount", "cgst", "sgst", "igst", "total gst", "grand total", "g. total", "roundup")
 
     def build(self, extracted_json: Optional[Dict[str, Any]], extracted_text: str) -> Dict[str, Any]:
         payload = extracted_json if isinstance(extracted_json, dict) else {}
         lines = self._group_lines(payload)
         blocks = self._group_blocks(lines)
         self._classify_blocks(blocks)
+        zones = self._build_zones(blocks)
 
-        header = self._extract_header(blocks, extracted_text)
-        parties = self._extract_parties(blocks, extracted_text)
-        products = self._extract_products(blocks)
-        expenses = self._extract_expenses(blocks)
-        totals = self._extract_totals(blocks, products, expenses, extracted_text)
+        header = self._extract_header(blocks, extracted_text, zones)
+        parties = self._extract_parties(blocks, extracted_text, zones)
+        products = self._extract_products(blocks, zones)
+        expenses = self._extract_expenses(blocks, zones)
+        totals = self._extract_totals(blocks, products, expenses, extracted_text, zones)
         self._validate(parties, products, totals)
 
         if not products:
@@ -128,9 +163,99 @@ class StructureEngine:
                         "preview": [ln.text for ln in block.lines[:3]],
                     }
                     for block in blocks
-                ]
+                ],
+                "zones": zones,
             },
         }
+
+    def _build_zones(self, blocks: Sequence[Block]) -> Dict[str, List[str]]:
+        lines: List[Line] = []
+        for block in blocks:
+            lines.extend(block.lines)
+        lines.sort(key=lambda ln: ln.y)
+        txt_lines = [_clean(ln.text) for ln in lines if _clean(ln.text)]
+        if not txt_lines:
+            return {
+                "header": [],
+                "supplier_block": [],
+                "buyer_block": [],
+                "invoice_meta": [],
+                "items_block": [],
+                "totals_block": [],
+                "footer": [],
+            }
+
+        buyer_idx = self._find_idx(txt_lines, self._buyer_anchor_tokens)
+        table_idx = self._find_table_idx(txt_lines)
+        totals_idx = self._find_idx(txt_lines, self._totals_anchor_tokens, start=(table_idx or 0))
+        bank_idx = self._find_idx(txt_lines, ("bank details", "bank name", "a/c", "ifsc", "upi payment"), start=(totals_idx or 0))
+
+        supplier_end = buyer_idx if buyer_idx is not None else (table_idx if table_idx is not None else min(len(txt_lines), 40))
+        buyer_start = buyer_idx if buyer_idx is not None else supplier_end
+        buyer_end = table_idx if table_idx is not None else len(txt_lines)
+        items_start = table_idx if table_idx is not None else buyer_end
+        items_end = totals_idx if totals_idx is not None else len(txt_lines)
+        totals_start = totals_idx if totals_idx is not None else items_end
+        totals_end = bank_idx if bank_idx is not None else len(txt_lines)
+        footer_start = bank_idx if bank_idx is not None else totals_end
+
+        supplier_block = [t for t in txt_lines[:supplier_end] if not self._is_global_noise_line(t)]
+        buyer_block = [t for t in txt_lines[buyer_start:buyer_end] if not self._is_global_noise_line(t)]
+        items_block = [t for t in txt_lines[items_start:items_end] if not self._is_global_noise_line(t)]
+        totals_block = [t for t in txt_lines[totals_start:totals_end] if not self._is_global_noise_line(t)]
+        footer = [t for t in txt_lines[footer_start:] if not self._is_global_noise_line(t)]
+        header = [t for t in txt_lines[: min(len(txt_lines), 20)] if not self._is_global_noise_line(t)]
+        invoice_meta = [
+            t
+            for t in txt_lines[: buyer_end]
+            if not self._is_global_noise_line(t)
+            and any(k in t.lower() for k in ("invoice no", "invoice number", "invoice date", "dated", "challan", "p.o", "pay mode", "bill credit"))
+        ]
+
+        return {
+            "header": header,
+            "supplier_block": supplier_block,
+            "buyer_block": buyer_block,
+            "invoice_meta": invoice_meta,
+            "items_block": items_block,
+            "totals_block": totals_block,
+            "footer": footer,
+        }
+
+    @staticmethod
+    def _find_idx(lines: Sequence[str], tokens: Sequence[str], start: int = 0) -> Optional[int]:
+        for i in range(max(0, start), len(lines)):
+            low = lines[i].lower()
+            if any(tok in low for tok in tokens):
+                return i
+        return None
+
+    def _find_table_idx(self, lines: Sequence[str]) -> Optional[int]:
+        for i, t in enumerate(lines):
+            low = t.lower()
+            if "description" in low and ("qty" in low or "quantity" in low) and ("rate" in low or "amount" in low):
+                return i
+            if any(tok in low for tok in ("hsn/sac", "description of goods / service", "billed quantity")):
+                return i
+        return None
+
+    @staticmethod
+    def _is_global_noise_line(text: str) -> bool:
+        t = _clean(text)
+        if not t:
+            return True
+        if any(p.search(t) for p in GLOBAL_NOISE_PATTERNS):
+            return True
+        return False
+
+    @staticmethod
+    def _block_from_text_lines(lines: Sequence[str], label: str) -> Optional[Block]:
+        if not lines:
+            return None
+        objs = [Line(text=_clean(t), x_min=0.0, x_max=0.0, y=float(i), cells=[]) for i, t in enumerate(lines) if _clean(t)]
+        if not objs:
+            return None
+        return Block(lines=objs, label=label)
 
     def _group_lines(self, payload: Dict[str, Any]) -> List[Line]:
         rows = payload.get("rows")
@@ -288,21 +413,79 @@ class StructureEngine:
             label = max(scores.items(), key=lambda kv: kv[1])[0]
             block.label = label if scores[label] > 0 else "other"
 
-    def _extract_header(self, blocks: Sequence[Block], extracted_text: str) -> Dict[str, Optional[str]]:
-        text = "\n".join(block.text for block in blocks if block.label in {"header", "supplier", "other"}) + "\n" + (extracted_text or "")
+    def _extract_header(self, blocks: Sequence[Block], extracted_text: str, zones: Optional[Dict[str, List[str]]] = None) -> Dict[str, Optional[str]]:
+        zone_lines = []
+        if isinstance(zones, dict):
+            zone_lines.extend(zones.get("invoice_meta", []))
+            zone_lines.extend(zones.get("header", []))
+        text = "\n".join(zone_lines) + "\n" + "\n".join(block.text for block in blocks if block.label in {"header", "supplier", "other"}) + "\n" + (extracted_text or "")
         inv = None
-        m = INV_RE.search(text)
-        if m:
-            inv = _clean(m.group(1))
+        text_lines = [ln for ln in text.splitlines() if _clean(ln)]
+        inv_line_idx = None
+        for idx, ln in enumerate(text_lines):
+            low = ln.lower()
+            if "invoice no" in low or "invoice number" in low:
+                inv_line_idx = idx
+                break
+        if inv_line_idx is not None:
+            inv_line = text_lines[inv_line_idx]
+            mline = re.search(r"invoice\s*(?:no|number)\s*[:#-]?\s*([A-Za-z0-9\/\-]{2,})", inv_line, re.I)
+            if mline:
+                cand = _clean(mline.group(1))
+                if self._is_valid_invoice_token(cand):
+                    inv = cand
+            if inv is None:
+                for j in range(inv_line_idx, min(len(text_lines), inv_line_idx + 4)):
+                    for m in re.finditer(r"\b[A-Za-z0-9][A-Za-z0-9\/\-]{2,}\b", text_lines[j]):
+                        cand = _clean(m.group(0))
+                        if self._is_valid_invoice_token(cand):
+                            inv = cand
+                            break
+                    if inv:
+                        break
         dt = None
-        md = DATE_RE.search(text)
-        if md:
-            dt = _clean(md.group(1))
+        for idx, ln in enumerate(text_lines):
+            low = ln.lower()
+            if "invoice date" in low or re.search(r"\bdated\b", low):
+                md = DATE_RE.search(ln)
+                if md:
+                    dt = _clean(md.group(1))
+                    break
+                for j in range(idx, min(len(text_lines), idx + 3)):
+                    md2 = DATE_RE.search(text_lines[j])
+                    if md2:
+                        dt = _clean(md2.group(1))
+                        break
+                if dt:
+                    break
+        if dt is None:
+            md = DATE_RE.search(text)
+            if md:
+                dt = _clean(md.group(1))
         return {"Invoice_Number": inv, "Invoice_Date": dt}
 
-    def _extract_parties(self, blocks: Sequence[Block], extracted_text: str) -> Dict[str, Any]:
-        supplier_block = self._best_block(blocks, "supplier")
-        buyer_block = self._best_buyer_block(blocks)
+    @staticmethod
+    def _is_valid_invoice_token(token: str) -> bool:
+        t = _clean(token)
+        if not t:
+            return False
+        if DATE_RE.search(t):
+            return False
+        if re.search(r"\b(?:msme|udaym|gstin|tax invoice|invoice)\b", t, re.I):
+            return False
+        if len(t) < 3:
+            return False
+        if not re.search(r"\d", t):
+            return False
+        return True
+
+    def _extract_parties(self, blocks: Sequence[Block], extracted_text: str, zones: Optional[Dict[str, List[str]]] = None) -> Dict[str, Any]:
+        supplier_block = self._block_from_text_lines((zones or {}).get("supplier_block", []), "supplier")
+        buyer_block = self._block_from_text_lines((zones or {}).get("buyer_block", []), "buyer")
+        if supplier_block is None:
+            supplier_block = self._best_block(blocks, "supplier")
+        if buyer_block is None:
+            buyer_block = self._best_buyer_block(blocks)
 
         supplier_clean = self._clean_block_for_party(supplier_block)
         buyer_clean = self._clean_block_for_party(buyer_block)
@@ -310,6 +493,8 @@ class StructureEngine:
         customer_candidates = self._rank_party_candidates(buyer_clean, role="buyer")
         supplier_name = supplier_candidates[0] if supplier_candidates else self._extract_party_name(supplier_block, fallback_anchor="gstin")
         customer_name = customer_candidates[0] if customer_candidates else self._extract_buyer_name(buyer_block)
+        if customer_name and customer_name.lower() in {"buyer", "bill to", "consignee", "customer"}:
+            customer_name = None
         supplier_gst = self._extract_gst(supplier_block)
         customer_gst = self._extract_gst(buyer_block)
         supplier_addr = self._extract_address_after_name(supplier_block, supplier_name)
@@ -340,8 +525,10 @@ class StructureEngine:
             "_customer_candidates": customer_candidates[:2],
         }
 
-    def _extract_products(self, blocks: Sequence[Block]) -> List[Dict[str, Any]]:
-        table_block = self._best_block(blocks, "table")
+    def _extract_products(self, blocks: Sequence[Block], zones: Optional[Dict[str, List[str]]] = None) -> List[Dict[str, Any]]:
+        table_block = self._block_from_text_lines((zones or {}).get("items_block", []), "table")
+        if table_block is None:
+            table_block = self._best_block(blocks, "table")
         if not table_block:
             return []
 
@@ -421,8 +608,10 @@ class StructureEngine:
 
         return products
 
-    def _extract_expenses(self, blocks: Sequence[Block]) -> List[Dict[str, Any]]:
-        summary = self._best_block(blocks, "summary")
+    def _extract_expenses(self, blocks: Sequence[Block], zones: Optional[Dict[str, List[str]]] = None) -> List[Dict[str, Any]]:
+        summary = self._block_from_text_lines((zones or {}).get("totals_block", []), "summary")
+        if summary is None:
+            summary = self._best_block(blocks, "summary")
         if not summary:
             return []
         out: List[Dict[str, Any]] = []
@@ -454,18 +643,30 @@ class StructureEngine:
         products: Sequence[Dict[str, Any]],
         expenses: Sequence[Dict[str, Any]],
         extracted_text: str,
+        zones: Optional[Dict[str, List[str]]] = None,
     ) -> Dict[str, Optional[float]]:
-        text = "\n".join(block.text for block in blocks) + "\n" + (extracted_text or "")
+        zone_text = ""
+        if isinstance(zones, dict):
+            zone_text = "\n".join(zones.get("totals_block", []) + zones.get("invoice_meta", []))
+        text = zone_text + "\n" + "\n".join(block.text for block in blocks) + "\n" + (extracted_text or "")
         sgst = self._amount_from_keyword(text, "sgst")
         cgst = self._amount_from_keyword(text, "cgst")
         igst = self._amount_from_keyword(text, "igst")
         total = self._amount_from_any(text, ("g. total", "g total", "grand total"))
         if total is None:
             total = self._amount_from_any(text, ("total",))
-        taxable = self._amount_from_any(text, ("sub total", "taxable"))
+        taxable = self._amount_after_any(text, ("taxable amt", "taxable amount", "sub total"))
+        if taxable is None or taxable < 1.0:
+            taxable_from_tax = self._taxable_from_tax_lines(text)
+            if taxable_from_tax is not None:
+                taxable = taxable_from_tax
         if taxable is None:
             vals = [p.get("amount") for p in products if isinstance(p.get("amount"), (int, float))]
             taxable = sum(float(v) for v in vals) if vals else None
+        elif taxable is not None and taxable < 1.0:
+            vals = [p.get("amount") for p in products if isinstance(p.get("amount"), (int, float))]
+            if vals:
+                taxable = sum(float(v) for v in vals)
         total_exp = sum(float(e.get("amount") or 0.0) for e in expenses)
         return {
             "SGST_Amount": sgst,
@@ -491,10 +692,6 @@ class StructureEngine:
 
         if total <= 0 and taxable > 0:
             totals["Total_Amount"] = round(taxable + sgst + cgst + igst + exp, 2)
-        elif total > 0 and taxable > 0:
-            expected = taxable + sgst + cgst + igst + exp
-            if abs(total - expected) > max(3.0, 0.02 * max(1.0, total)):
-                totals["Total_Amount"] = round(expected, 2)
 
         if parties.get("SupplierName") and parties.get("Bank_Name"):
             if str(parties["SupplierName"]).strip().lower() == str(parties["Bank_Name"]).strip().lower():
@@ -529,7 +726,12 @@ class StructureEngine:
     def _rank_party_candidates(self, block: Optional[Block], role: str) -> List[str]:
         if not block:
             return []
-        lines = self._merge_multiline_entities([ln.text for ln in block.lines])
+        raw_lines = [ln.text for ln in block.lines]
+        if role == "buyer":
+            lines = [_clean(self._split_composite_line(t)) for t in raw_lines]
+            lines = [t for t in lines if t]
+        else:
+            lines = self._merge_multiline_entities(raw_lines)
         candidates: List[Tuple[int, str]] = []
         for text in lines:
             score = self._score_party_candidate(text, role)
@@ -581,10 +783,14 @@ class StructureEngine:
     def _score_party_candidate(self, text: str, role: str) -> int:
         t = _clean(text)
         t = re.sub(r"\s*[-|]\s*\d{4}\s*[-/]\s*\d{1,4}\s*$", " ", t)
+        if role == "buyer":
+            t = re.sub(r"^\s*(buyer|bill to|consignee|customer)\s*[:\-]?\s*", "", t, flags=re.I)
         t = _clean(t)
         low = t.lower()
         score = 0
         if not t:
+            return -99
+        if low in {"buyer", "bill to", "consignee", "customer"}:
             return -99
         if any(p.search(t) for p in DROP_LINE_PATTERNS):
             return -99
@@ -596,8 +802,30 @@ class StructureEngine:
             return -99
         if any(k in low for k in ("original", "duplicate", "triplicate", "copy", "irn", "ack", "invoice", "dated", "bank")):
             score -= 8
+        if any(
+            k in low
+            for k in (
+                "contact person",
+                "mobile",
+                "p.o",
+                "challan",
+                "bill pay status",
+                "pay mode",
+                "bill credit",
+                "due date",
+                "delivery by",
+                "lr no",
+                "old balance",
+                "new balance",
+            )
+        ):
+            score -= 8
         if any(word in low for word in ("corp", "corporation", "pvt", "ltd", "traders", "co.", "company", "motors")):
             score += 5
+        if any(word in low for word in ("motor", "parts", "auto", "agencies", "agency", "industries", "enterprises", "stores")):
+            score += 4
+        if any(word in low for word in ("road", "bazar", "bazaar", "nagar", "state", "district", "pin", "madhya pradesh", "indore")):
+            score -= 5
         if len(re.findall(r"[A-Za-z]", t)) >= 5:
             score += 3
         if t.isupper() and len(t.split()) >= 2:
@@ -665,14 +893,14 @@ class StructureEngine:
             low = ln.text.lower()
             if any(k in low for k in ("buyer", "bill to", "consignee", "m/s")):
                 for j in range(i + 1, min(len(block.lines), i + 5)):
-                    t = block.lines[j].text
+                    t = self._split_composite_line(block.lines[j].text)
                     lt = t.lower()
                     if "gstin" in lt:
                         break
                     if len(re.findall(r"[A-Za-z]", t)) >= 4:
                         return _clean(t)
         for ln in block.lines:
-            t = ln.text
+            t = self._split_composite_line(ln.text)
             lt = t.lower()
             if any(k in lt for k in ("buyer", "bill to", "consignee", "gstin")):
                 continue
@@ -739,7 +967,7 @@ class StructureEngine:
                 continue
             nums = _extract_nums(ln)
             if nums:
-                return max(nums)
+                return nums[-1]
         return None
 
     def _amount_from_any(self, text: str, keys: Sequence[str]) -> Optional[float]:
@@ -751,6 +979,31 @@ class StructureEngine:
             if nums:
                 return max(nums)
         return None
+
+    def _amount_after_any(self, text: str, keys: Sequence[str]) -> Optional[float]:
+        for ln in text.splitlines():
+            low = ln.lower()
+            if not any(k in low for k in keys):
+                continue
+            nums = _extract_nums(ln)
+            if nums:
+                return nums[0]
+        return None
+
+    def _taxable_from_tax_lines(self, text: str) -> Optional[float]:
+        candidates: List[float] = []
+        for ln in text.splitlines():
+            low = ln.lower()
+            if not any(k in low for k in ("cgst", "sgst", "igst")):
+                continue
+            nums = _extract_nums(ln)
+            if len(nums) >= 2:
+                first = nums[0]
+                if first > 1:
+                    candidates.append(first)
+        if not candidates:
+            return None
+        return max(candidates)
 
     @staticmethod
     def _first_match(pattern: str, text: str) -> Optional[str]:

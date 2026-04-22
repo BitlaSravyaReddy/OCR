@@ -9,6 +9,7 @@ import os
 from google import genai
 from openai import OpenAI
 
+from llm.embedded_prompts import PURCHASE_INVOICE_PROMPT, SALES_INVOICE_PROMPT
 from llm_request import load_api_key
 
 LOGGER = logging.getLogger(__name__)
@@ -20,6 +21,18 @@ REMOVE_LINES_IF_CONTAIN = (
     "transport",
     "remarks",
     "reference",
+)
+
+LLM_NOISE_LINE_PATTERNS = (
+    re.compile(r"\birn\b", re.I),
+    re.compile(r"\back\s*no\b", re.I),
+    re.compile(r"\bmsme\b", re.I),
+    re.compile(r"\budyam\b", re.I),
+    re.compile(r"\bcin\b", re.I),
+    re.compile(r"\bqr\s*code\b", re.I),
+    re.compile(r"\bdeclaration\b", re.I),
+    re.compile(r"\bterms\s*&?\s*condition", re.I),
+    re.compile(r"\bthis is a computer generated\b", re.I),
 )
 
 EXPENSE_BANNED_TOKENS = (
@@ -39,10 +52,11 @@ def load_prompt(invoice_type: str) -> str:
     prompts_dir = Path(__file__).resolve().parents[1] / "prompts"
     file_name = "Purchase_Invoice.txt" if invoice_type == "Purchase Invoice" else "Sales_Invoice.txt"
     prompt_file = prompts_dir / file_name
-    if not prompt_file.exists():
-        raise FileNotFoundError(f"Prompt file not found: {prompt_file}")
-    LOGGER.info("Using prompt file: %s", prompt_file)
-    return prompt_file.read_text(encoding="utf-8")
+    if prompt_file.exists():
+        LOGGER.info("Using prompt file: %s", prompt_file)
+        return prompt_file.read_text(encoding="utf-8")
+    LOGGER.info("Prompt file not found (%s). Using embedded prompt fallback.", prompt_file)
+    return PURCHASE_INVOICE_PROMPT if invoice_type == "Purchase Invoice" else SALES_INVOICE_PROMPT
 
 
 def _trim_for_prompt(value: Any, max_rows: int = 40) -> Any:
@@ -67,7 +81,7 @@ def _trim_for_prompt(value: Any, max_rows: int = 40) -> Any:
         low = rt.lower()
         if any(tok in low for tok in REMOVE_LINES_IF_CONTAIN):
             continue
-        if re.search(r"\birn\b|\back\b", low):
+        if any(p.search(rt) for p in LLM_NOISE_LINE_PATTERNS):
             continue
         if re.search(r"\b[a-f0-9]{10,}\b", rt, re.I):
             continue
@@ -94,7 +108,7 @@ def _strip_noise_lines(text: str) -> str:
         low = ln.lower()
         if any(tok in low for tok in REMOVE_LINES_IF_CONTAIN):
             continue
-        if re.search(r"\birn\b|\back\b", low):
+        if any(p.search(ln) for p in LLM_NOISE_LINE_PATTERNS):
             continue
         if re.search(r"\b[a-f0-9]{10,}\b", ln, re.I):
             continue
@@ -221,6 +235,23 @@ Tesseract boxes sample (trimmed):
 # Compact Party Evidence (highest priority for names):
 ```json
 {json.dumps(compact, ensure_ascii=False, indent=2)}
+```
+"""
+    structure_debug = structured_data.get("_structure_debug", {}) if isinstance(structured_data, dict) else {}
+    zones = structure_debug.get("zones", {}) if isinstance(structure_debug, dict) else {}
+    if isinstance(zones, dict) and zones:
+        compact_zones = {
+            "supplier_block": (zones.get("supplier_block") or [])[:10],
+            "buyer_block": (zones.get("buyer_block") or [])[:10],
+            "invoice_meta": (zones.get("invoice_meta") or [])[:10],
+            "items_block": (zones.get("items_block") or [])[:20],
+            "totals_block": (zones.get("totals_block") or [])[:20],
+        }
+        message += f"""
+
+# Structured Zones (use these sections first, avoid cross-zone mixing):
+```json
+{json.dumps(compact_zones, ensure_ascii=False, indent=2)}
 ```
 """
     if party_segmentation:

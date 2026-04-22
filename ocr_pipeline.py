@@ -16,7 +16,65 @@ import requests
 
 # Reduce startup noise and avoid network model-host checks in production runs.
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+os.environ.setdefault("PADDLE_PDX_EAGER_INIT", "False")
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
+
+
+def _configure_windows_dll_search_paths() -> None:
+    if os.name != "nt":
+        return
+
+    candidate_dirs: List[Path] = []
+    base_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    candidate_dirs.extend(
+        [
+            base_dir,
+            base_dir / "paddle" / "libs",
+            base_dir / "paddle" / "base",
+            base_dir / "paddle" / "base" / ".." / "libs",
+            base_dir / "torch" / "lib",
+            base_dir / "cv2",
+        ]
+    )
+
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidate_dirs.extend(
+            [
+                exe_dir,
+                exe_dir / "_internal",
+                exe_dir / "_internal" / "paddle" / "libs",
+                exe_dir / "_internal" / "paddle" / "base",
+                exe_dir / "_internal" / "torch" / "lib",
+                exe_dir / "_internal" / "cv2",
+            ]
+        )
+
+    seen: set[str] = set()
+    valid_dirs: List[str] = []
+    for directory in candidate_dirs:
+        try:
+            resolved = str(directory.resolve())
+        except Exception:
+            resolved = str(directory)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if os.path.isdir(resolved):
+            valid_dirs.append(resolved)
+
+    if valid_dirs:
+        os.environ["PATH"] = os.pathsep.join(valid_dirs + [os.environ.get("PATH", "")])
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if callable(add_dll_directory):
+            for directory in valid_dirs:
+                try:
+                    add_dll_directory(directory)
+                except Exception:
+                    pass
+
+
+_configure_windows_dll_search_paths()
 
 from paddleocr import PaddleOCR
 
@@ -495,6 +553,7 @@ class HybridOCR:
         self.render_dpi = max(120, render_dpi)
         self.min_token_confidence = max(0.0, min(1.0, min_token_confidence))
         self._ocr_engines: Dict[str, PaddleOCR] = {}
+        self._dependency_hint_logged = False
 
     def _get_engine(self, lang: str) -> PaddleOCR:
         if lang not in self._ocr_engines:
@@ -518,6 +577,17 @@ class HybridOCR:
                 return []
             except Exception as exc:  # noqa: BLE001 - OCR engines may fail unpredictably.
                 last_error = str(exc)
+                if (
+                    "dependency error occurred during pipeline creation" in last_error.lower()
+                    and not self._dependency_hint_logged
+                ):
+                    self._dependency_hint_logged = True
+                    logging.warning(
+                        "PaddleOCR pipeline creation hit a dependency gate. "
+                        "In a frozen EXE this usually means PaddleX OCR extra modules "
+                        "or package metadata were not bundled. Rebuild the app with the "
+                        "updated InvoiceBatchProcessor.spec."
+                    )
                 logging.warning(
                     "OCR predict failed for %s lang=%s attempt=%d error=%s",
                     source_label,

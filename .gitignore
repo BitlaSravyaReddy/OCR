@@ -61,3 +61,24 @@ images/
 Purchase/*.json
 Sales/*.json
 json_*_parse_output.json
+
+# Local runtime / client data
+Client-*/
+*_INVOICE_SYSTEM/
+_INVOICE_SYSTEM/
+PURCHASE_JSON/
+SALES_JSON/
+*_JSON/
+batch_summary.json
+batch_run.log
+batch_run_debug.log
+test_batch_summary.json
+
+# Local installer/build outputs
+build_installer/
+dist_installer/
+installer_output/
+release_assets/
+
+# Local scratch / demo trees
+tests/
